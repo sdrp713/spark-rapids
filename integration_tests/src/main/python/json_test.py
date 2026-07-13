@@ -963,13 +963,14 @@ def test_from_json_struct_timestamp_fallback_legacy(timestamp_gen, timestamp_for
     "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
     "dd/MM/yyyy'T'HH:mm:ss[.SSS][XXX]",
 ])
-@pytest.mark.xfail(reason='https://github.com/NVIDIA/spark-rapids/issues/10535')
 def test_from_json_struct_timestamp_fallback_non_default_format(timestamp_gen, timestamp_format):
     json_string_gen = StringGen(r'{ "a": ' + timestamp_gen + ' }') \
         .with_special_case('{ "a": null }') \
         .with_special_case('null')
     options = { 'timestampFormat': timestamp_format } if timestamp_format else { }
-    conf = copy_and_update(_enable_all_types_conf, {'spark.sql.legacy.timeParserPolicy': 'CORRECTED'})
+    conf = copy_and_update(_enable_all_types_conf, {
+        'spark.sql.legacy.timeParserPolicy': 'CORRECTED',
+        'spark.rapids.sql.expression.cpuBridge.enabled': 'false'})
     assert_gpu_fallback_collect(
         lambda spark : unary_op_df(spark, json_string_gen) \
             .select(f.col('a'), f.from_json('a', 'struct<a:timestamp>', options)),
@@ -1596,16 +1597,17 @@ def test_spark_from_json_timestamp_default_format():
     "Asia/Urumqi",
     "Asia/Hong_Kong",
     "Europe/Brussels"], ids=idfn)
-@allow_non_gpu('JsonToStructs')
-@pytest.mark.xfail(reason='https://github.com/NVIDIA/spark-rapids/issues/10535')
+@allow_non_gpu('ProjectExec')
 # This is expected to fallback to the CPU because the timestampFormat is not supported, but really is, so we shold be better about this.
 def test_spark_from_json_timestamp_format_option_zoneid(zone_id):
     schema = StructType([StructField("t", TimestampType())])
     data = [[r'''{"t": "2016-01-01T00:00:00"}''']]
+    conf = copy_and_update(_enable_all_types_conf, {
+        'spark.rapids.sql.expression.cpuBridge.enabled': 'false'})
     assert_gpu_fallback_collect(
         lambda spark : spark.createDataFrame(data, 'json STRING').select(f.col('json'), f.from_json(f.col('json'), schema, {'timestampFormat': "yyyy-MM-dd'T'HH:mm:ss",'timeZone': zone_id})),
-        'JsonToStructs',
-        conf =_enable_all_types_conf)
+        'ProjectExec',
+        conf=conf)
 
 @pytest.mark.parametrize('zone_id', [
     "UTC",
