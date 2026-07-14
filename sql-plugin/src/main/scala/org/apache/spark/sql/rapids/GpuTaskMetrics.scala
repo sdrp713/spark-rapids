@@ -525,7 +525,8 @@ class GpuTaskMetrics extends Serializable with Logging {
         acc.add(1L)
       }
     } catch {
-      case _: IllegalArgumentException => // accumulator not yet registered; no-op
+      case _: IllegalArgumentException | _: IllegalStateException =>
+        // accumulator not yet registered; no-op
     }
   }
 
