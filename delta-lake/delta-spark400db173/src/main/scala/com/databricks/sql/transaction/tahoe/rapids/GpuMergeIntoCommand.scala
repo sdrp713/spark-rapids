@@ -47,7 +47,7 @@ import org.apache.spark.sql.catalyst.catalog.CatalogTable
 import org.apache.spark.sql.catalyst.encoders.{ExpressionEncoder, RowEncoder}
 import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, AttributeReference, BasePredicate, Expression, IsNull, Literal, NamedExpression, PredicateHelper, UnsafeProjection}
 import org.apache.spark.sql.catalyst.expressions.codegen.GeneratePredicate
-import org.apache.spark.sql.catalyst.plans.logical.{DeltaMergeIntoClause, DeltaMergeIntoMatchedClause, DeltaMergeIntoMatchedDeleteClause, DeltaMergeIntoMatchedUpdateClause, DeltaMergeIntoNotMatchedBySourceClause, DeltaMergeIntoNotMatchedBySourceDeleteClause, DeltaMergeIntoNotMatchedBySourceUpdateClause, DeltaMergeIntoNotMatchedClause, LogicalPlan, Project}
+import org.apache.spark.sql.catalyst.plans.logical.{DeltaMergeIntoMatchedClause, DeltaMergeIntoMatchedDeleteClause, DeltaMergeIntoMatchedUpdateClause, DeltaMergeIntoNotMatchedBySourceClause, DeltaMergeIntoNotMatchedBySourceDeleteClause, DeltaMergeIntoNotMatchedBySourceUpdateClause, DeltaMergeIntoNotMatchedClause, LogicalPlan, Project}
 import org.apache.spark.sql.catalyst.types.DataTypeUtils.toAttributes
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.execution.SQLExecution
@@ -804,11 +804,16 @@ case class GpuMergeIntoCommand(
       exprs.map(resolveOnJoinedPlan)
     }
 
-    def targetClauseOutput(clause: DeltaMergeIntoClause): Seq[Seq[Expression]] = clause match {
+    def matchedClauseOutput(
+        clause: DeltaMergeIntoMatchedClause): Seq[Seq[Expression]] = clause match {
       case u: DeltaMergeIntoMatchedUpdateClause =>
         updateOutput(u.resolvedActions.map(_.expr))
       case _: DeltaMergeIntoMatchedDeleteClause =>
         deleteOutput()
+    }
+
+    def notMatchedBySourceClauseOutput(
+        clause: DeltaMergeIntoNotMatchedBySourceClause): Seq[Seq[Expression]] = clause match {
       case u: DeltaMergeIntoNotMatchedBySourceUpdateClause =>
         updateOutput(u.resolvedActions.map(_.expr))
       case _: DeltaMergeIntoNotMatchedBySourceDeleteClause =>
@@ -854,11 +859,11 @@ case class GpuMergeIntoCommand(
     val sourceRowHasNoMatch =
       resolveOnJoinedPlan(Seq(IsNull(UnresolvedAttribute(TARGET_ROW_PRESENT_COL)))).head
     val matchedConditions = matchedClauses.map(clauseCondition)
-    val matchedOutputs = matchedClauses.map(targetClauseOutput)
+    val matchedOutputs = matchedClauses.map(matchedClauseOutput)
     val notMatchedConditions = notMatchedClauses.map(clauseCondition)
     val notMatchedOutputs = notMatchedClauses.map(notMatchedClauseOutput)
     val notMatchedBySourceConditions = notMatchedBySourceClauses.map(clauseCondition)
-    val notMatchedBySourceOutputs = notMatchedBySourceClauses.map(targetClauseOutput)
+    val notMatchedBySourceOutputs = notMatchedBySourceClauses.map(notMatchedBySourceClauseOutput)
     val noopCopyOutput =
       resolveOnJoinedPlan(targetOutputCols :+ FalseLiteral :+ incrNoopCountExpr :+
           CDC_TYPE_NOT_CDC_LITERAL)
