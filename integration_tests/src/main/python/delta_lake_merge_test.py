@@ -189,8 +189,8 @@ def test_delta_merge_fallback_with_deletion_vectors(spark_tmp_path, spark_tmp_ta
 @ignore_order
 @pytest.mark.skipif(is_databricks_runtime() and spark_version() < "3.3.2", reason="NOT MATCHED BY SOURCE added in DBR 12.2")
 @pytest.mark.skipif((not is_databricks_runtime()) and is_before_spark_340(), reason="NOT MATCHED BY SOURCE added in Delta Lake 2.4")
-@pytest.mark.skipif(is_spark_41x(),
-                    reason="NOT MATCHED BY SOURCE is supported on the GPU with OSS Delta 4.1")
+@pytest.mark.skipif(is_spark_41x() or is_databricks173_or_later(),
+                    reason="NOT MATCHED BY SOURCE is supported on the GPU")
 @pytest.mark.parametrize("enable_deletion_vectors", deletion_vector_values_with_xfail_reasons(
                             enabled_xfail_reason='https://github.com/NVIDIA/spark-rapids/issues/12042'), ids=idfn)
 def test_delta_merge_not_matched_by_source_fallback(spark_tmp_path, spark_tmp_table_factory, enable_deletion_vectors):
@@ -216,8 +216,8 @@ def test_delta_merge_not_matched_by_source_fallback(spark_tmp_path, spark_tmp_ta
 @allow_non_gpu(*delta_meta_allow)
 @delta_lake
 @ignore_order
-@pytest.mark.skipif(not is_spark_41x(),
-                    reason="NOT MATCHED BY SOURCE is supported on the GPU with OSS Delta 4.1")
+@pytest.mark.skipif(not (is_spark_41x() or is_databricks173_or_later()),
+                    reason="NOT MATCHED BY SOURCE is not supported on the GPU")
 @pytest.mark.parametrize("use_cdf", [False, True], ids=idfn)
 def test_delta_merge_not_matched_by_source(spark_tmp_path, spark_tmp_table_factory, use_cdf):
     def src_table_func(spark):
@@ -229,7 +229,7 @@ def test_delta_merge_not_matched_by_source(spark_tmp_path, spark_tmp_table_facto
 
     merge_sql = "MERGE INTO {dest_table} AS dest " \
                 "USING {src_table} AS src " \
-                "ON src.a == dest.a " \
+                "ON src.a == dest.a AND dest.a <= 2 " \
                 "WHEN MATCHED THEN UPDATE SET dest.b = src.b " \
                 "WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.b) " \
                 "WHEN NOT MATCHED BY SOURCE AND dest.a = 3 THEN DELETE " \
@@ -239,7 +239,8 @@ def test_delta_merge_not_matched_by_source(spark_tmp_path, spark_tmp_table_facto
         spark_tmp_path, spark_tmp_table_factory,
         use_cdf=use_cdf, enable_deletion_vectors=False,
         src_table_func=src_table_func, dest_table_func=dest_table_func,
-        merge_sql=merge_sql, compare_logs=False, conf=delta_merge_enabled_conf)
+        merge_sql=merge_sql, compare_logs=False, partition_columns=["a"],
+        conf=delta_merge_enabled_conf)
 
     expected = [(1, 100), (2, 0), (4, -1), (5, 500)]
     data_path = spark_tmp_path + "/DELTA_DATA"
@@ -249,6 +250,30 @@ def test_delta_merge_not_matched_by_source(spark_tmp_path, spark_tmp_table_facto
                            read_delta_path(spark, data_path + "/" + run).orderBy("a").collect()],
             conf=delta_merge_enabled_conf)
         assert_equal(expected, actual)
+
+
+@allow_non_gpu(*delta_meta_allow)
+@delta_lake
+@ignore_order
+@pytest.mark.skipif(not (is_spark_41x() or is_databricks173_or_later()),
+                    reason="NOT MATCHED BY SOURCE is not supported on the GPU")
+def test_delta_merge_not_matched_by_source_disables_insert_only_fast_path(
+        spark_tmp_path, spark_tmp_table_factory):
+    merge_sql = "MERGE INTO {dest_table} AS dest " \
+                "USING {src_table} AS src " \
+                "ON src.a == dest.a " \
+                "WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.b) " \
+                "WHEN NOT MATCHED BY SOURCE THEN DELETE"
+
+    assert_delta_sql_merge_collect(
+        spark_tmp_path, spark_tmp_table_factory,
+        use_cdf=False, enable_deletion_vectors=False,
+        src_table_func=lambda spark: spark.createDataFrame(
+            [(1, 100), (3, 300)], "a INT, b INT"),
+        dest_table_func=lambda spark: spark.createDataFrame(
+            [(1, 10), (2, 20)], "a INT, b INT"),
+        merge_sql=merge_sql, compare_logs=False, conf=delta_merge_enabled_conf)
+
 
 @allow_non_gpu("BroadcastHashJoinExec,ColumnarToRowExec,BroadcastExchangeExec,"
                "UnionExec,UnionWithLocalDataExec,RangeExec",
@@ -469,36 +494,6 @@ def test_delta_merge_standard_upsert_db173_smoke(spark_tmp_path, spark_tmp_table
         num_slices=10,
         compare_logs=False,
         conf=delta_merge_enabled_conf)
-
-
-@allow_non_gpu("ExecutedCommandExec,BroadcastHashJoinExec,ColumnarToRowExec,BroadcastExchangeExec,DataWritingCommandExec", delta_write_fallback_allow, *delta_meta_allow)
-@delta_lake
-@ignore_order
-@pytest.mark.skipif(not is_databricks173_or_later(),
-                    reason="Issue-specific fallback coverage for Databricks 17.3+")
-def test_delta_merge_not_matched_by_source_db173_fallback(spark_tmp_path, spark_tmp_table_factory):
-    def checker(data_path, do_merge):
-        assert_gpu_fallback_write(do_merge, read_delta_path, data_path, "ExecutedCommandExec",
-                                  conf=delta_merge_enabled_conf)
-
-    merge_sql = "MERGE INTO {dest_table} " \
-                "USING {src_table} " \
-                "ON {src_table}.a == {dest_table}.a " \
-                "WHEN MATCHED THEN " \
-                "  UPDATE SET {dest_table}.b = {src_table}.b " \
-                "WHEN NOT MATCHED THEN " \
-                "  INSERT (a, b) VALUES ({src_table}.a, {src_table}.b) " \
-                "WHEN NOT MATCHED BY SOURCE AND {dest_table}.b > 0 THEN " \
-                "  UPDATE SET {dest_table}.b = 0"
-    delta_sql_merge_test(spark_tmp_path, spark_tmp_table_factory,
-                         use_cdf=False, enable_deletion_vectors=False,
-                         src_table_func=lambda spark: binary_op_df(
-                             spark, SetValuesGen(IntegerType(), range(10))),
-                         dest_table_func=lambda spark: binary_op_df(
-                             spark, SetValuesGen(IntegerType(), range(20, 30))),
-                         merge_sql=merge_sql,
-                         check_func=checker)
-
 
 @allow_non_gpu("ExecutedCommandExec", *delta_meta_allow)
 @delta_lake
