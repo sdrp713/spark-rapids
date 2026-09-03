@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@ import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, Expression}
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, UnaryNode}
 import org.apache.spark.sql.execution.{SparkPlan, SparkStrategy, UnaryExecNode}
-import org.apache.spark.sql.types.DataType
+import org.apache.spark.sql.types.{BooleanType, DataType}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
 object RapidsProcessDeltaMergeJoinStrategy extends SparkStrategy {
@@ -351,23 +351,36 @@ class GpuRapidsProcessDeltaMergeJoinIterator(
       default: Seq[Expression]): Seq[ColumnarBatch] = {
     closeOnExcept(new ArrayBuffer[ColumnarBatch]) { results =>
       var leftOverBatch = input
+      var allRowsMatched = false
       conditions.zip(outputs).foreach { case (condition, output) =>
-        closeOnExcept(leftOverBatch) { _ =>
-          if (leftOverBatch.numRows() > 0) {
-            val (matchBatch, notMatchBatch) =
-              splitBatchAndClose(leftOverBatch, inputTypes, condition)
-            leftOverBatch = notMatchBatch
-            withResource(matchBatch) { _ =>
-              output.foreach { exprs =>
-                results.append(GpuProjectExec.project(matchBatch, exprs))
+        if (!allRowsMatched && leftOverBatch.numRows() > 0) {
+          condition match {
+            case GpuLiteral(true, BooleanType) =>
+              withResource(leftOverBatch) { _ =>
+                output.foreach { exprs =>
+                  results.append(GpuProjectExec.project(leftOverBatch, exprs))
+                }
               }
-            }
+              allRowsMatched = true
+            case _ =>
+              closeOnExcept(leftOverBatch) { _ =>
+                val (matchBatch, notMatchBatch) =
+                  splitBatchAndClose(leftOverBatch, inputTypes, condition)
+                leftOverBatch = notMatchBatch
+                withResource(matchBatch) { _ =>
+                  output.foreach { exprs =>
+                    results.append(GpuProjectExec.project(matchBatch, exprs))
+                  }
+                }
+              }
           }
         }
       }
-      withResource(leftOverBatch) { _ =>
-        if (leftOverBatch.numRows() > 0) {
-          results.append(GpuProjectExec.project(leftOverBatch, default))
+      if (!allRowsMatched) {
+        withResource(leftOverBatch) { _ =>
+          if (leftOverBatch.numRows() > 0) {
+            results.append(GpuProjectExec.project(leftOverBatch, default))
+          }
         }
       }
       results.toSeq
