@@ -275,6 +275,37 @@ def test_delta_merge_not_matched_by_source_disables_insert_only_fast_path(
         merge_sql=merge_sql, compare_logs=False, conf=delta_merge_enabled_conf)
 
 
+@allow_non_gpu(*delta_meta_allow)
+@delta_lake
+@pytest.mark.skipif(not is_databricks173_or_later(),
+                    reason="NOT MATCHED BY SOURCE is not supported on the GPU")
+def test_delta_merge_not_matched_by_source_duplicate_match_error(
+        spark_tmp_path, spark_tmp_table_factory):
+    source_view = spark_tmp_table_factory.get()
+
+    def do_merge(spark):
+        gpu_enabled = str(spark.conf.get("spark.rapids.sql.enabled", "false")).lower() == "true"
+        target_path = spark_tmp_path + ("/GPU" if gpu_enabled else "/CPU")
+        spark.createDataFrame([(1, 10), (2, 20)], "a INT, b INT").write.format("delta") \
+            .option("delta.enableDeletionVectors", "false").save(target_path)
+        spark.createDataFrame([(1, 100), (1, 101)], "a INT, b INT") \
+            .createOrReplaceTempView(source_view)
+        return spark.sql(f"""
+            MERGE INTO delta.`{target_path}` AS target
+            USING {source_view} AS source
+            ON target.a = source.a
+            WHEN MATCHED THEN UPDATE SET target.b = source.b
+            WHEN NOT MATCHED BY SOURCE THEN UPDATE SET target.b = -1
+        """).collect()
+
+    assert_gpu_and_cpu_error(
+        do_merge,
+        conf=delta_merge_enabled_conf,
+        error_message=re.compile(
+            r"DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW_IN_MERGE|multiple source rows matched",
+            re.IGNORECASE))
+
+
 @allow_non_gpu("BroadcastHashJoinExec,ColumnarToRowExec,BroadcastExchangeExec,"
                "UnionExec,UnionWithLocalDataExec,RangeExec",
                delta_write_fallback_allow, *delta_meta_allow)

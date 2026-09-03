@@ -452,8 +452,8 @@ case class GpuMergeIntoCommand(
 
   /**
    * Find the target table files that contain the rows that satisfy the merge condition. This is
-   * implemented as an inner or right-outer join between the source query/table and the target
-   * table using the merge condition.
+   * implemented as an inner join between the source query/table and the target table using the
+   * merge condition.
    */
   private def findTouchedFiles(
       spark: SparkSession,
@@ -490,13 +490,17 @@ case class GpuMergeIntoCommand(
     val targetDF = Dataset.ofRows(spark, buildTargetPlanWithFiles(deltaTxn, dataSkippedFiles))
         .withColumn(ROW_ID_COL, monotonically_increasing_id())
         .withColumn(FILE_NAME_COL, input_file_name())
-    val joinType = if (notMatchedBySourceClauses.isEmpty) "inner" else "right_outer"
     val joinToFindTouchedFiles =
-      sourceDF.join(targetDF, DFUDFShims.exprToColumn(condition), joinType)
+      sourceDF.join(targetDF, DFUDFShims.exprToColumn(condition), "inner")
 
     // Process the matches from the inner join to record touched files and find multiple matches
-    val collectTouchedFiles = joinToFindTouchedFiles
-        .select(col(ROW_ID_COL), recordTouchedFileName(col(FILE_NAME_COL)).as("one"))
+    val collectTouchedFiles = if (notMatchedBySourceClauses.isEmpty) {
+      joinToFindTouchedFiles
+          .select(col(ROW_ID_COL), recordTouchedFileName(col(FILE_NAME_COL)).as("one"))
+    } else {
+      // All target files are already known to be touched. Avoid running the file-recording UDF.
+      joinToFindTouchedFiles.select(col(ROW_ID_COL), lit(1).as("one"))
+    }
 
     // Calculate frequency of matches per source row
     val matchedRowCounts = collectTouchedFiles.groupBy(ROW_ID_COL).agg(sum("one").as("count"))
@@ -540,12 +544,14 @@ case class GpuMergeIntoCommand(
     }
 
     // Get the AddFiles using the touched file names.
-    val touchedFileNames = touchedFilesAccum.value.iterator().asScala.toSeq
-    logTrace(s"findTouchedFiles: matched files:\n\t${touchedFileNames.mkString("\n\t")}")
-
-    val nameToAddFileMap = generateCandidateFileMap(targetDeltaLog.dataPath, dataSkippedFiles)
-    val touchedAddFiles = touchedFileNames.map(f =>
-      getTouchedFile(targetDeltaLog.dataPath, f, nameToAddFileMap))
+    val touchedAddFiles = if (notMatchedBySourceClauses.nonEmpty) {
+      dataSkippedFiles
+    } else {
+      val touchedFileNames = touchedFilesAccum.value.iterator().asScala.toSeq
+      logTrace(s"findTouchedFiles: matched files:\n\t${touchedFileNames.mkString("\n\t")}")
+      val nameToAddFileMap = generateCandidateFileMap(targetDeltaLog.dataPath, dataSkippedFiles)
+      touchedFileNames.map(f => getTouchedFile(targetDeltaLog.dataPath, f, nameToAddFileMap))
+    }
 
     // When the target table is empty, and the optimizer optimized away the join entirely
     // numSourceRows will be incorrectly 0. We need to scan the source table once to get the correct
