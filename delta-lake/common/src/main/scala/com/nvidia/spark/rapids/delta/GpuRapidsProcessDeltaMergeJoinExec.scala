@@ -246,6 +246,24 @@ class GpuRapidsProcessDeltaMergeJoinIterator(
   private[this] var nextBatch: Option[ColumnarBatch] = None
   private[this] val opTime = metrics.getOrElse(GpuMetric.OP_TIME_LEGACY, NoopMetric)
   private[this] val numOutputRows = metrics.getOrElse(GpuMetric.NUM_OUTPUT_ROWS, NoopMetric)
+  private[this] val shouldDeleteColumnIndex =
+    output.indexWhere(_.name == GpuDeltaMergeConstants.ROW_DROPPED_COL) match {
+      case -1 => output.size
+      case index => index
+    }
+  private[this] val allProjections = matchedOutputs.flatten ++ notMatchedOutputs.flatten ++
+      notMatchedBySourceOutputs.flatten ++ Seq(noopCopyOutput, deleteRowOutput)
+  private[this] val canElideDeletedRows = {
+    val cdcDisabled = !output.exists(_.name == GpuDeltaMergeConstants.ROW_DROPPED_COL)
+    cdcDisabled && allProjections.forall { expressions =>
+      expressions.lift(shouldDeleteColumnIndex).exists {
+        case GpuLiteral(false, BooleanType) => true
+        case GpuLiteral(true, BooleanType) =>
+          expressions.lift(shouldDeleteColumnIndex + 1).exists(_.references.isEmpty)
+        case _ => false
+      }
+    }
+  }
 
   // Don't install the callback if in a unit test
   Option(TaskContext.get()).foreach { tc =>
@@ -329,15 +347,14 @@ class GpuRapidsProcessDeltaMergeJoinIterator(
       }
     }
     val shouldNotDeleteBatch = withResource(bigTable) { _ =>
-      // If ROW_DROPPED_COL is not in output schema
-      // then CDC must be disabled and it's the column after our output cols
-      val shouldDeleteColumnIndex =
-        output.zipWithIndex.find(_._1.name == GpuDeltaMergeConstants.ROW_DROPPED_COL).map(_._2)
-            .getOrElse(output.size)
-      val shouldDeleteColumn = bigTable.getColumn(shouldDeleteColumnIndex)
-      withResource(shouldDeleteColumn.not()) { notDeleteColumn =>
-        withResource(bigTable.filter(notDeleteColumn)) { notDeleteTable =>
-          GpuColumnVector.from(notDeleteTable, intermediateTypes)
+      if (canElideDeletedRows) {
+        GpuColumnVector.from(bigTable, intermediateTypes)
+      } else {
+        val shouldDeleteColumn = bigTable.getColumn(shouldDeleteColumnIndex)
+        withResource(shouldDeleteColumn.not()) { notDeleteColumn =>
+          withResource(bigTable.filter(notDeleteColumn)) { notDeleteTable =>
+            GpuColumnVector.from(notDeleteTable, intermediateTypes)
+          }
         }
       }
     }
@@ -358,18 +375,23 @@ class GpuRapidsProcessDeltaMergeJoinIterator(
             case GpuLiteral(true, BooleanType) =>
               withResource(leftOverBatch) { _ =>
                 output.foreach { exprs =>
-                  results.append(GpuProjectExec.project(leftOverBatch, exprs))
+                  projectOutput(leftOverBatch, exprs, results)
                 }
               }
               allRowsMatched = true
             case _ =>
               closeOnExcept(leftOverBatch) { _ =>
-                val (matchBatch, notMatchBatch) =
-                  splitBatchAndClose(leftOverBatch, inputTypes, condition)
-                leftOverBatch = notMatchBatch
-                withResource(matchBatch) { _ =>
-                  output.foreach { exprs =>
-                    results.append(GpuProjectExec.project(matchBatch, exprs))
+                if (output.size == 1 && isElidableDeletedRow(output.head)) {
+                  leftOverBatch = processDeletedRowsAndClose(
+                    leftOverBatch, condition, output.head)
+                } else {
+                  val (matchBatch, notMatchBatch) =
+                    splitBatchAndClose(leftOverBatch, inputTypes, condition)
+                  leftOverBatch = notMatchBatch
+                  withResource(matchBatch) { _ =>
+                    output.foreach { exprs =>
+                      projectOutput(matchBatch, exprs, results)
+                    }
                   }
                 }
               }
@@ -379,11 +401,76 @@ class GpuRapidsProcessDeltaMergeJoinIterator(
       if (!allRowsMatched) {
         withResource(leftOverBatch) { _ =>
           if (leftOverBatch.numRows() > 0) {
-            results.append(GpuProjectExec.project(leftOverBatch, default))
+            projectOutput(leftOverBatch, default, results)
           }
         }
       }
       results.toSeq
+    }
+  }
+
+  /**
+   * CDC-disabled deletes only need to evaluate their metric expression. Avoid projecting the
+   * complete target row, concatenating it with surviving rows, and filtering it out afterwards.
+   */
+  private def projectOutput(
+      input: ColumnarBatch,
+      expressions: Seq[Expression],
+      results: ArrayBuffer[ColumnarBatch]): Unit = {
+    if (isElidableDeletedRow(expressions)) {
+      withResource(GpuProjectExec.project(
+          input, Seq(expressions(shouldDeleteColumnIndex + 1)))) { _ => () }
+    } else {
+      results.append(GpuProjectExec.project(input, expressions))
+    }
+  }
+
+  private def isElidableDeletedRow(expressions: Seq[Expression]): Boolean = {
+    canElideDeletedRows && expressions(shouldDeleteColumnIndex) ==
+        GpuLiteral(true, BooleanType) && expressions(shouldDeleteColumnIndex + 1).references.isEmpty
+  }
+
+  /**
+   * Evaluate a delete predicate without materializing the full-width rows that it selects.
+   */
+  private def processDeletedRowsAndClose(
+      input: ColumnarBatch,
+      predicate: Expression,
+      expressions: Seq[Expression]): ColumnarBatch = {
+    withResource(input) { _ =>
+      withResource(GpuColumnVector.from(input)) { inputTable =>
+        withResource(predicate.columnarEval(input)) { predicateColumn =>
+          val deletedRowCount = countDeletedRows(predicateColumn)
+          updateDeleteMetric(deletedRowCount, expressions(shouldDeleteColumnIndex + 1))
+          filterNotDeletedRows(inputTable, predicateColumn)
+        }
+      }
+    }
+  }
+
+  private def countDeletedRows(predicateColumn: GpuColumnVector): Int = {
+    withResource(new Table(predicateColumn.getBase)) { predicateTable =>
+      withResource(predicateTable.filter(predicateColumn.getBase)) {
+        _.getRowCount.toInt
+      }
+    }
+  }
+
+  private def updateDeleteMetric(deletedRowCount: Int, metricExpression: Expression): Unit = {
+    if (deletedRowCount > 0) {
+      withResource(new ColumnarBatch(Array.empty, deletedRowCount)) { metricInput =>
+        withResource(GpuProjectExec.project(metricInput, Seq(metricExpression))) { _ => () }
+      }
+    }
+  }
+
+  private def filterNotDeletedRows(
+      inputTable: Table,
+      predicateColumn: GpuColumnVector): ColumnarBatch = {
+    withResource(predicateColumn.getBase.not()) { notPredicateColumn =>
+      withResource(inputTable.filter(notPredicateColumn)) { notDeletedTable =>
+        GpuColumnVector.from(notDeletedTable, inputTypes)
+      }
     }
   }
 
