@@ -102,8 +102,6 @@ def assert_delta_sql_update_collect(spark_tmp_path, use_cdf, enable_deletion_vec
 @allow_non_gpu('ColumnarToRowExec', *delta_meta_allow)
 @delta_lake
 @ignore_order
-@pytest.mark.skipif(is_databricks_runtime(),
-                    reason="Persistent DV command acceleration is OSS Delta only")
 @pytest.mark.skipif(not supports_delta_lake_deletion_vectors(), reason="Deletion vectors aren't supported")
 @pytest.mark.skipif((not is_databricks_runtime()) and is_before_spark_353(),
                     reason="Update with deletion vector is only supported after delta.io 3.0.0")
@@ -111,14 +109,18 @@ def assert_delta_sql_update_collect(spark_tmp_path, use_cdf, enable_deletion_vec
     "UPDATE delta.`{path}` SET a = 1 WHERE a = 0",
     "UPDATE delta.`{path}` SET a = 1"
 ], ids=["predicate", "no_predicate"])
-@pytest.mark.parametrize("use_metadata_row_index", [True, False], ids=idfn)
+@pytest.mark.parametrize(
+    "use_metadata_row_index",
+    [True] if is_databricks_runtime() else [True, False],
+    ids=idfn)
 def test_delta_update_with_deletion_vectors(
         spark_tmp_path, update_sql, use_metadata_row_index):
     conf = copy_and_update(
         delta_update_enabled_conf,
         {"spark.databricks.delta.update.deletionVectors.persistent": "true",
          "spark.databricks.delta.deletionVectors.useMetadataRowIndex":
-             str(use_metadata_row_index).lower()})
+             str(use_metadata_row_index).lower(),
+         "spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "true"})
     assert_delta_sql_update_collect(
         spark_tmp_path,
         use_cdf=False,
@@ -129,8 +131,6 @@ def test_delta_update_with_deletion_vectors(
 
 @allow_non_gpu("ExecutedCommandExec", *delta_meta_allow)
 @delta_lake
-@pytest.mark.skipif(is_databricks_runtime(),
-                    reason="Persistent DV command acceleration is OSS Delta only")
 @pytest.mark.skipif(not supports_delta_lake_deletion_vectors(),
                     reason="Deletion vectors are not supported")
 @pytest.mark.skipif((not is_databricks_runtime()) and is_before_spark_353(),
@@ -143,7 +143,9 @@ def test_delta_update_twice_with_dv(spark_tmp_path):
 
     conf = copy_and_update(
         delta_update_enabled_conf,
-        {"spark.databricks.delta.update.deletionVectors.persistent": "true"})
+        {"spark.databricks.delta.update.deletionVectors.persistent": "true",
+         "spark.databricks.delta.deletionVectors.useMetadataRowIndex": "true",
+         "spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "true"})
     with_cpu_session(lambda spark: setup_delta_dest_tables(
         spark, data_path, generate_dest_data, use_cdf=False, enable_deletion_vectors=True))
     cpu_path = data_path + "/CPU"

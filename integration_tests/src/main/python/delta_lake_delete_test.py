@@ -186,9 +186,10 @@ def test_delta_delete_disabled_fallback(spark_tmp_path, disable_conf, enable_del
 @delta_lake
 @ignore_order
 @pytest.mark.parametrize("use_cdf", [True, False], ids=idfn)
-@pytest.mark.parametrize("use_metadata_row_index", [True, False], ids=idfn)
-@pytest.mark.skipif(is_databricks_runtime(),
-                    reason="Persistent DV command acceleration is OSS Delta only")
+@pytest.mark.parametrize(
+    "use_metadata_row_index",
+    [True] if is_databricks_runtime() else [True, False],
+    ids=idfn)
 @pytest.mark.skipif(not supports_delta_lake_deletion_vectors(), \
     reason="Deletion vectors new in Delta Lake 2.4 / Apache Spark 3.4")
 def test_delta_delete_with_deletion_vectors(
@@ -197,7 +198,8 @@ def test_delta_delete_with_deletion_vectors(
         delta_delete_enabled_conf,
         {"spark.databricks.delta.delete.deletionVectors.persistent": "true",
          "spark.databricks.delta.deletionVectors.useMetadataRowIndex":
-             str(use_metadata_row_index).lower()})
+             str(use_metadata_row_index).lower(),
+         "spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "true"})
     assert_delta_sql_delete_collect(
         spark_tmp_path,
         use_cdf=use_cdf,
@@ -556,8 +558,6 @@ def test_delta_delete_preserves_row_tracking(spark_tmp_path):
 @delta_lake
 @inject_oom
 @pytest.mark.parametrize("use_chunked_reader", [True, False], ids=idfn)
-@pytest.mark.skipif(is_databricks_runtime(),
-                    reason="Persistent DV command acceleration is OSS Delta only")
 @pytest.mark.skipif(not supports_delta_lake_deletion_vectors() or is_before_spark_353(),
     reason="Deletion vectors new in Delta Lake 2.4 / Apache Spark 3.4")
 def test_delta_delete_twice_with_dv(spark_tmp_path, use_chunked_reader):
@@ -572,6 +572,8 @@ def test_delta_delete_twice_with_dv(spark_tmp_path, use_chunked_reader):
                           IntegerGen(special_cases=[200]))
     conf = copy_and_update(delta_delete_enabled_conf,
         {"spark.databricks.delta.delete.deletionVectors.persistent": "true",
+         "spark.databricks.delta.deletionVectors.useMetadataRowIndex": "true",
+         "spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "true",
          "spark.rapids.sql.reader.chunked": str(use_chunked_reader).lower()})
     # Setup identical tables for CPU and GPU
     with_cpu_session(lambda spark: setup_delta_dest_tables(spark, data_path,
