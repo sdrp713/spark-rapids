@@ -67,13 +67,6 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       txn: OptimisticTransaction): (Seq[FileAction], Map[String, Long]) = {
     val (actions, metrics) =
       DMLWithDeletionVectorsHelper.processUnmodifiedData(spark, touchedFiles, txn.snapshot)
-    val longMetrics = metrics.map {
-      case (name, value: java.lang.Number) => name -> value.longValue()
-      case (name, value) =>
-        throw new IllegalStateException(
-          s"Unexpected DBR deletion-vector metric type for $name: " +
-            Option(value).map(_.getClass.getName).getOrElse("null"))
-    }
-    (actions, longMetrics)
+    (actions, metrics)
   }
 }
