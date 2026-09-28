@@ -1520,10 +1520,26 @@ case class DeltaParquetTableReader(
   private lazy val deletionVectorSkipRowIndexes =
     MakeParquetTableWithDVProducer.deletionVectorSkipRowIndexes(readDataSchema)
 
+  private val rowIndexColumn =
+    GpuDeltaParquetFileFormatBase.findGpuRowIndexColumn(readDataSchema)
+
   override protected def postProcessChunk(chunk: Table): Table = {
-    // The cuDF reader prepends an extra index column in the output table.
-    // We need to drop it before returning as we don't use it.
-    RapidsDeletionVectors.dropFirstColumn(chunk)
+    // Keep the prepended cuDF physical index through schema evolution when Delta requests it.
+    if (rowIndexColumn >= 0) chunk else RapidsDeletionVectors.dropFirstColumn(chunk)
+  }
+
+  override protected def evolveSchemaAndClose(table: Table): Table = {
+    if (rowIndexColumn < 0) {
+      super.evolveSchemaAndClose(table)
+    } else {
+      withResource(MakeParquetTableWithDVProducer.castPhysicalRowIndex(table)) {
+        physicalRowIndex =>
+        val dataTable = RapidsDeletionVectors.dropFirstColumn(table)
+        val evolvedTable = super.evolveSchemaAndClose(dataTable)
+        RapidsDeletionVectors.replaceColumnAndClose(
+          evolvedTable, rowIndexColumn, physicalRowIndex)
+      }
+    }
   }
 
   override def next: Table = {
@@ -1533,6 +1549,14 @@ case class DeltaParquetTableReader(
 }
 
 object MakeParquetTableWithDVProducer extends Logging {
+  private[delta] def castPhysicalRowIndex(table: Table): ColumnVector = {
+    closeOnExcept(table) { _ =>
+      RmmRapidsRetryIterator.withRetryNoSplit[ColumnVector] {
+        table.getColumn(0).castTo(DType.INT64)
+      }
+    }
+  }
+
   private def isDeletionVectorSkipRowColumn(name: String): Boolean =
     name == DeltaParquetFileFormat.IS_ROW_DELETED_COLUMN_NAME ||
       name == GpuDeltaParquetFileFormat.EDGE_COMPUTED_COLUMN_SKIP_ROW
@@ -1643,27 +1667,34 @@ object MakeParquetTableWithDVProducer extends Logging {
           }
         }
       }
-      // The cuDF reader prepends an extra index column in the output table.
-      // We need to drop it before returning as we don't use it.
-      val tableWithoutIndex = RapidsDeletionVectors.dropFirstColumn(table)
-      closeOnExcept(tableWithoutIndex) { _ =>
-        GpuParquetScan.throwIfRebaseNeededInExceptionMode(tableWithoutIndex, dateRebaseMode,
-          timestampRebaseMode)
-        if (readDataSchema.length < tableWithoutIndex.getNumberOfColumns) {
-          throw new QueryExecutionException(s"Expected ${readDataSchema.length} columns " +
-            s"but read ${tableWithoutIndex.getNumberOfColumns} from ${splits.mkString("; ")}")
+      val rowIndexColumn =
+        GpuDeltaParquetFileFormatBase.findGpuRowIndexColumn(readDataSchema)
+      val physicalRowIndex =
+        if (rowIndexColumn >= 0) Some(castPhysicalRowIndex(table)) else None
+      withResource(physicalRowIndex) { _ =>
+        val tableWithoutIndex = RapidsDeletionVectors.dropFirstColumn(table)
+        closeOnExcept(tableWithoutIndex) { _ =>
+          GpuParquetScan.throwIfRebaseNeededInExceptionMode(tableWithoutIndex, dateRebaseMode,
+            timestampRebaseMode)
+          if (readDataSchema.length < tableWithoutIndex.getNumberOfColumns) {
+            throw new QueryExecutionException(s"Expected ${readDataSchema.length} columns " +
+              s"but read ${tableWithoutIndex.getNumberOfColumns} from ${splits.mkString("; ")}")
+          }
         }
+        metrics(NUM_OUTPUT_BATCHES) += 1
+        val evolvedSchemaTable = ParquetSchemaUtils.evolveSchemaIfNeededAndClose(tableWithoutIndex,
+          clippedParquetSchema, readDataSchema, isSchemaCaseSensitive, useFieldId)
+        val tableWithRowIndex = physicalRowIndex.map { index =>
+          RapidsDeletionVectors.replaceColumnAndClose(evolvedSchemaTable, rowIndexColumn, index)
+        }.getOrElse(evolvedSchemaTable)
+        val outputTable = GpuParquetScan.rebaseDateTime(tableWithRowIndex, dateRebaseMode,
+          timestampRebaseMode)
+        // Recorded before materialization to match the chunked reader, whose next() records in
+        // super.next and materializes afterwards.
+        GpuMetric.recordOutputBatchBytes(outputTable, metrics.get(GPU_OUTPUT_BATCH_BYTES))
+        new SingleGpuDataProducer(
+          materializeDeletionVectorSkipRowColumnsAsFalseIfNeeded(outputTable, skipRowIndexes))
       }
-      metrics(NUM_OUTPUT_BATCHES) += 1
-      val evolvedSchemaTable = ParquetSchemaUtils.evolveSchemaIfNeededAndClose(tableWithoutIndex,
-        clippedParquetSchema, readDataSchema, isSchemaCaseSensitive, useFieldId)
-      val outputTable = GpuParquetScan.rebaseDateTime(evolvedSchemaTable, dateRebaseMode,
-        timestampRebaseMode)
-      // Recorded before materialization to match the chunked reader, whose next() records in
-      // super.next and materializes afterwards.
-      GpuMetric.recordOutputBatchBytes(outputTable, metrics.get(GPU_OUTPUT_BATCH_BYTES))
-      new SingleGpuDataProducer(
-        materializeDeletionVectorSkipRowColumnsAsFalseIfNeeded(outputTable, skipRowIndexes))
     }
   }
 }

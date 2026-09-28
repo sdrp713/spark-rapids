@@ -27,8 +27,11 @@ object UpdateCommandMetaShim {
       DeletionVectorUtils.deletionVectorsWritable(deltaLog.unsafeVolatileSnapshot)
 
     if (dvFeatureEnabled && meta.updateCmd.conf.getConf(
-      DeltaSQLConf.UPDATE_USE_PERSISTENT_DELETION_VECTORS)) {
-      meta.willNotWorkOnGpu("Deletion vector writes are not supported on GPU")
+      DeltaSQLConf.UPDATE_USE_PERSISTENT_DELETION_VECTORS) &&
+        !supportsPersistentDeletionVectorWrites(meta)) {
+      meta.willNotWorkOnGpu(
+        "Persistent deletion vector writes on GPU require DBR metadata row indexes and " +
+          "native cuDF deletion-vector predicate pushdown")
     }
   }
 
@@ -38,8 +41,19 @@ object UpdateCommandMetaShim {
       DeletionVectorUtils.deletionVectorsWritable(deltaLog.unsafeVolatileSnapshot)
 
     if (dvFeatureEnabled && meta.updateCmd.conf.getConf(
-      DeltaSQLConf.UPDATE_USE_PERSISTENT_DELETION_VECTORS)) {
-      meta.willNotWorkOnGpu("Deletion vector writes are not supported on GPU")
+      DeltaSQLConf.UPDATE_USE_PERSISTENT_DELETION_VECTORS) &&
+        !supportsPersistentDeletionVectorWrites(meta)) {
+      meta.willNotWorkOnGpu(
+        "Persistent deletion vector writes on GPU require DBR metadata row indexes and " +
+          "native cuDF deletion-vector predicate pushdown")
     }
   }
+
+  private def supportsPersistentDeletionVectorWrites(meta: UpdateCommandMeta): Boolean =
+    meta.updateCmd.conf.getConf(DeltaSQLConf.DELETION_VECTORS_USE_METADATA_ROW_INDEX) &&
+      meta.conf.isDeltaDeletionVectorPredicatePushdownEnabled
+
+  private def supportsPersistentDeletionVectorWrites(meta: UpdateCommandEdgeMeta): Boolean =
+    meta.updateCmd.conf.getConf(DeltaSQLConf.DELETION_VECTORS_USE_METADATA_ROW_INDEX) &&
+      meta.conf.isDeltaDeletionVectorPredicatePushdownEnabled
 }

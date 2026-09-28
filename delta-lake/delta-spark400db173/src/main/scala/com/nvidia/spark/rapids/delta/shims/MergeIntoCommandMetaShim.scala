@@ -41,16 +41,21 @@ object MergeIntoCommandMetaShim {
     tagPersistentDeletionVectorFallback(
       meta,
       mergeCmd.targetFileIndex.deltaLog,
-      mergeCmd.conf.getConf(DeltaSQLConf.MERGE_USE_PERSISTENT_DELETION_VECTORS))
+      mergeCmd.conf.getConf(DeltaSQLConf.MERGE_USE_PERSISTENT_DELETION_VECTORS),
+      mergeCmd.conf.getConf(DeltaSQLConf.DELETION_VECTORS_USE_METADATA_ROW_INDEX))
   }
 
   private def tagPersistentDeletionVectorFallback(
       meta: RapidsMeta[_, _, _],
       deltaLog: DeltaLog,
-      usePersistentDeletionVectors: Boolean): Unit = {
+      usePersistentDeletionVectors: Boolean,
+      useMetadataRowIndex: Boolean): Unit = {
     if (DeletionVectorUtils.deletionVectorsWritable(deltaLog.unsafeVolatileSnapshot) &&
-        usePersistentDeletionVectors) {
-      meta.willNotWorkOnGpu("Deletion vectors are not supported on GPU")
+        usePersistentDeletionVectors &&
+        !(useMetadataRowIndex && meta.conf.isDeltaDeletionVectorPredicatePushdownEnabled)) {
+      meta.willNotWorkOnGpu(
+        "Persistent deletion vector writes on GPU require DBR metadata row indexes and " +
+          "native cuDF deletion-vector predicate pushdown")
     }
   }
 
