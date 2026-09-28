@@ -67,6 +67,9 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       txn: OptimisticTransaction): (Seq[FileAction], Map[String, Long]) = {
     val (actions, metrics) =
       DMLWithDeletionVectorsHelper.processUnmodifiedData(spark, touchedFiles, txn.snapshot)
-    (actions, metrics)
+    // DBR's processUnmodifiedData reports zero modified rows for this external-row-index path.
+    // Derive the count from the replacement DV cardinality so existing deleted rows are excluded.
+    val numModifiedRows = touchedFiles.map(_.numberOfModifiedRows).sum
+    (actions, metrics.updated("numModifiedRows", numModifiedRows))
   }
 }
