@@ -59,7 +59,10 @@ private[rapids] object DMLWithDeletionVectorsHelperShims {
     val filePathColumnName = Iterator.from(0).map { suffix =>
       if (suffix == 0) GpuFilePathColumnPrefix else s"${GpuFilePathColumnPrefix}_${suffix}"
     }.find(name => !usedNames.exists(resolver(_, name))).get
-    val rowIndexField = GpuDeltaParquetFileFormatBase.GPU_ROW_INDEX_STRUCT_FIELD
+    // Preserve DBR's private metadata-column contract, then add the neutral RAPIDS marker used by
+    // the GPU reader to retain the physical row index through schema evolution.
+    val rowIndexField = GpuDeltaParquetFileFormatBase.markGpuRowIndexColumn(
+      DeltaParquetFileFormat.ROW_INDEX_STRUCT_FIELD)
     val rowIndexCol = AttributeReference(
       rowIndexField.name, rowIndexField.dataType, metadata = rowIndexField.metadata)()
 
