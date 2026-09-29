@@ -1308,6 +1308,46 @@ def test_delta_merge_deletion_vector_db173(spark_tmp_path, spark_tmp_table_facto
         merge_sql=merge_sql, compare_logs=False, conf=conf)
 
 
+@allow_non_gpu(*delta_meta_allow)
+@delta_lake
+@ignore_order
+@pytest.mark.skipif(not is_databricks173_or_later(),
+                    reason="Persistent-DV command acceleration requires DBR 17.3+")
+def test_delta_merge_deletion_vector_removed_file_metrics(
+        spark_tmp_path, spark_tmp_table_factory):
+    conf = copy_and_update(
+        delta_merge_enabled_conf,
+        {"spark.databricks.delta.merge.deletionVectors.persistent": "true",
+         "spark.databricks.delta.deletionVectors.useMetadataRowIndex": "true",
+         "spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "true",
+         "spark.databricks.delta.autoCompact.enabled": "false"})
+    merge_sql = "MERGE INTO {dest_table} AS target USING {src_table} AS source " \
+                "ON target.id = source.id " \
+                "WHEN MATCHED THEN UPDATE SET target.v = source.v"
+    assert_delta_sql_merge_collect(
+        spark_tmp_path, spark_tmp_table_factory,
+        use_cdf=False, enable_deletion_vectors=True,
+        src_table_func=lambda spark: spark.createDataFrame([(1, 100)], "id INT, v INT"),
+        dest_table_func=lambda spark: spark.createDataFrame(
+            [(1, 10, 0), (2, 20, 0), (3, 30, 1)], "id INT, v INT, p INT"),
+        merge_sql=merge_sql, compare_logs=False, partition_columns=["p"], conf=conf)
+
+    def history_metrics(spark, path):
+        row = spark.sql(f"DESCRIBE HISTORY delta.`{path}`") \
+            .where("operation = 'MERGE'").orderBy("version", ascending=False).first()
+        return {key: int(row["operationMetrics"].get(key, 0))
+                for key in ["numTargetBytesRemoved", "numTargetPartitionsRemovedFrom"]}
+
+    data_path = spark_tmp_path + "/DELTA_DATA"
+    cpu_metrics = with_cpu_session(
+        lambda spark: history_metrics(spark, data_path + "/CPU"), conf=conf)
+    gpu_metrics = with_cpu_session(
+        lambda spark: history_metrics(spark, data_path + "/GPU"), conf=conf)
+    assert cpu_metrics == gpu_metrics, f"CPU {cpu_metrics} vs GPU {gpu_metrics}"
+    assert gpu_metrics == {"numTargetBytesRemoved": 0,
+                           "numTargetPartitionsRemovedFrom": 0}
+
+
 @allow_non_gpu("ExecutedCommandExec,BroadcastHashJoinExec,ColumnarToRowExec,"
                "BroadcastExchangeExec,DataWritingCommandExec",
                delta_write_fallback_allow, *delta_meta_allow)
@@ -1315,14 +1355,20 @@ def test_delta_merge_deletion_vector_db173(spark_tmp_path, spark_tmp_table_facto
 @ignore_order
 @allow_non_gpu_delta_write_if(
     True, reason="the command runs on the CPU by design; its jobs are planned by the plugin")
-@pytest.mark.skipif(not is_databricks173_or_later(),
-                    reason="DBR 17.3 persistent-DV eligibility fallback coverage")
+@pytest.mark.skipif(not (is_databricks143() or is_databricks173_or_later()),
+                    reason="Databricks persistent-DV eligibility fallback coverage")
 @pytest.mark.parametrize("command", ["DELETE", "UPDATE", "MERGE"])
-@pytest.mark.parametrize("unsupported_conf", [
-    {"spark.databricks.delta.deletionVectors.useMetadataRowIndex": "false"},
-    {"spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "false"}
-], ids=["no_metadata_row_index", "no_native_dv_pushdown"])
-def test_delta_dml_deletion_vector_db173_fallback(
+@pytest.mark.parametrize(
+    "unsupported_conf",
+    [pytest.param({}, id="unsupported_dbr")]
+    if is_databricks143() else [
+        pytest.param(
+            {"spark.databricks.delta.deletionVectors.useMetadataRowIndex": "false"},
+            id="no_metadata_row_index"),
+        pytest.param(
+            {"spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "false"},
+            id="no_native_dv_pushdown")])
+def test_delta_dml_deletion_vector_databricks_fallback(
         spark_tmp_path, spark_tmp_table_factory, command, unsupported_conf):
     data_path = spark_tmp_path + "/DELTA_DATA"
     source_table = spark_tmp_table_factory.get()

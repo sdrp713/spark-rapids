@@ -126,6 +126,7 @@ abstract class GpuUpdateCommandBase(
     var numDeletionVectorsAdded: Long = 0
     var numDeletionVectorsRemoved: Long = 0
     var numDeletionVectorsUpdated: Long = 0
+    var numRemovedFiles: Long = 0
 
     val startTime = System.nanoTime()
     val numFilesTotal = txn.snapshot.numOfFiles
@@ -219,6 +220,7 @@ abstract class GpuUpdateCommandBase(
               numDeletionVectorsAdded = metricMap("numDeletionVectorsAdded")
               numDeletionVectorsRemoved = metricMap("numDeletionVectorsRemoved")
               numDeletionVectorsUpdated = metricMap("numDeletionVectorsUpdated")
+              numRemovedFiles = metricMap("numRemovedFiles")
               actions
             case None =>
               throw new IllegalStateException(
@@ -229,6 +231,7 @@ abstract class GpuUpdateCommandBase(
           if (shouldWriteDVs) {
             numDeletionVectorsRemoved = filesToRewrite.count(_.deletionVector != null)
           }
+          numRemovedFiles = filesToRewrite.length
           filesToRewrite.map(_.removeWithTimestamp(operationTimestamp))
         }
 
@@ -239,7 +242,7 @@ abstract class GpuUpdateCommandBase(
       metrics("numAddedFiles").set(numRewrittenFiles)
       metrics("numAddedChangeFiles").set(numAddedChangeFiles)
       metrics("changeFileBytes").set(changeFileBytes)
-      metrics("numRemovedFiles").set(numTouchedFiles)
+      metrics("numRemovedFiles").set(numRemovedFiles)
       metrics("executionTimeMs").set((System.nanoTime() - startTime) / 1000 / 1000)
       metrics("scanTimeMs").set(scanTimeMs)
       metrics("rewriteTimeMs").set(rewriteTimeMs)

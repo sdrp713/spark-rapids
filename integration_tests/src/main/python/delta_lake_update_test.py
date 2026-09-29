@@ -105,6 +105,8 @@ def assert_delta_sql_update_collect(spark_tmp_path, use_cdf, enable_deletion_vec
 @pytest.mark.skipif(not supports_delta_lake_deletion_vectors(), reason="Deletion vectors aren't supported")
 @pytest.mark.skipif((not is_databricks_runtime()) and is_before_spark_353(),
                     reason="Update with deletion vector is only supported after delta.io 3.0.0")
+@pytest.mark.skipif(is_databricks_runtime() and not is_databricks173_or_later(),
+                    reason="Persistent-DV command acceleration requires DBR 17.3+")
 @pytest.mark.parametrize("update_sql", [
     "UPDATE delta.`{path}` SET a = 1 WHERE a = 0",
     "UPDATE delta.`{path}` SET a = 1"
@@ -135,6 +137,8 @@ def test_delta_update_with_deletion_vectors(
                     reason="Deletion vectors are not supported")
 @pytest.mark.skipif((not is_databricks_runtime()) and is_before_spark_353(),
                     reason="Update with deletion vector requires delta.io 3.0.0 or later")
+@pytest.mark.skipif(is_databricks_runtime() and not is_databricks173_or_later(),
+                    reason="Persistent-DV command acceleration requires DBR 17.3+")
 def test_delta_update_twice_with_dv(spark_tmp_path):
     data_path = spark_tmp_path + "/DELTA_DATA"
 
@@ -178,6 +182,42 @@ def test_delta_update_twice_with_dv(spark_tmp_path):
     gpu_result = with_cpu_session(
         lambda spark: spark.read.format("delta").load(gpu_path).sort("a", "b").collect(), conf=conf)
     assert_equal(cpu_result, gpu_result)
+
+
+@allow_non_gpu('ColumnarToRowExec', *delta_meta_allow)
+@delta_lake
+@ignore_order
+@pytest.mark.skipif(not is_databricks173_or_later(),
+                    reason="Persistent-DV command acceleration requires DBR 17.3+")
+def test_delta_update_deletion_vector_history_metrics(spark_tmp_path):
+    conf = copy_and_update(
+        delta_update_enabled_conf,
+        {"spark.databricks.delta.update.deletionVectors.persistent": "true",
+         "spark.databricks.delta.deletionVectors.useMetadataRowIndex": "true",
+         "spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "true",
+         "spark.databricks.delta.autoCompact.enabled": "false"})
+    assert_delta_sql_update_collect(
+        spark_tmp_path,
+        use_cdf=False,
+        enable_deletion_vectors=True,
+        dest_table_func=lambda spark: spark.createDataFrame(
+            [(1, 10), (2, 20)], "id INT, v INT").coalesce(1),
+        update_sql="UPDATE delta.`{path}` SET v = 100 WHERE id = 1",
+        conf=conf)
+
+    def history_metrics(spark, path):
+        row = spark.sql(f"DESCRIBE HISTORY delta.`{path}`") \
+            .where("operation = 'UPDATE'").orderBy("version", ascending=False).first()
+        return {key: int(row["operationMetrics"].get(key, 0))
+                for key in ["numRemovedFiles", "numDeletionVectorsAdded"]}
+
+    data_path = spark_tmp_path + "/DELTA_DATA"
+    cpu_metrics = with_cpu_session(
+        lambda spark: history_metrics(spark, data_path + "/CPU"), conf=conf)
+    gpu_metrics = with_cpu_session(
+        lambda spark: history_metrics(spark, data_path + "/GPU"), conf=conf)
+    assert cpu_metrics == gpu_metrics, f"CPU {cpu_metrics} vs GPU {gpu_metrics}"
+    assert gpu_metrics == {"numRemovedFiles": 0, "numDeletionVectorsAdded": 1}
 
 fallback_test_params = [{"spark.rapids.sql.format.delta.write.enabled": "false"},
                         {"spark.rapids.sql.format.parquet.write.enabled": "false"},

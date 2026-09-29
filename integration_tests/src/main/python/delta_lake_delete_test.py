@@ -192,6 +192,8 @@ def test_delta_delete_disabled_fallback(spark_tmp_path, disable_conf, enable_del
     ids=idfn)
 @pytest.mark.skipif(not supports_delta_lake_deletion_vectors(), \
     reason="Deletion vectors new in Delta Lake 2.4 / Apache Spark 3.4")
+@pytest.mark.skipif(is_databricks_runtime() and not is_databricks173_or_later(),
+                    reason="Persistent-DV command acceleration requires DBR 17.3+")
 def test_delta_delete_with_deletion_vectors(
         spark_tmp_path, use_cdf, use_metadata_row_index):
     conf = copy_and_update(
@@ -207,6 +209,31 @@ def test_delta_delete_with_deletion_vectors(
         delete_sql="DELETE FROM delta.`{path}` WHERE a = 0",
         enable_deletion_vectors=True,
         conf=conf,
+        assert_gpu_delete_command=True)
+
+
+@allow_non_gpu("ColumnarToRowExec", *delta_meta_allow)
+@delta_lake
+@ignore_order
+@pytest.mark.skipif(not is_databricks173_or_later(),
+                    reason="Persistent-DV command acceleration requires DBR 17.3+")
+def test_delta_delete_deletion_vector_full_file_data_predicate(spark_tmp_path):
+    conf = copy_and_update(
+        delta_delete_enabled_conf,
+        {"spark.databricks.delta.delete.deletionVectors.persistent": "true",
+         "spark.databricks.delta.deletionVectors.useMetadataRowIndex": "true",
+         "spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "true",
+         "spark.databricks.delta.autoCompact.enabled": "false",
+         "spark.databricks.delta.delete.enableForceBackgroundAutoCompact": "false"})
+    assert_delta_sql_delete_collect(
+        spark_tmp_path,
+        use_cdf=False,
+        dest_table_func=lambda spark: spark.createDataFrame(
+            [(1, "a"), (2, "b")], "id INT, v STRING").coalesce(1),
+        delete_sql="DELETE FROM delta.`{path}` WHERE id >= 0",
+        enable_deletion_vectors=True,
+        conf=conf,
+        expected_num_affected_rows=2,
         assert_gpu_delete_command=True)
 
 @allow_non_gpu("SortExec, ColumnarToRowExec", *delta_meta_allow)
@@ -560,6 +587,8 @@ def test_delta_delete_preserves_row_tracking(spark_tmp_path):
 @pytest.mark.parametrize("use_chunked_reader", [True, False], ids=idfn)
 @pytest.mark.skipif(not supports_delta_lake_deletion_vectors() or is_before_spark_353(),
     reason="Deletion vectors new in Delta Lake 2.4 / Apache Spark 3.4")
+@pytest.mark.skipif(is_databricks_runtime() and not is_databricks173_or_later(),
+                    reason="Persistent-DV command acceleration requires DBR 17.3+")
 def test_delta_delete_twice_with_dv(spark_tmp_path, use_chunked_reader):
     """Regression test for https://github.com/NVIDIA/spark-rapids/issues/14442.
     The second DELETE on a DV-enabled table accesses _metadata.file_path and _metadata.row_index
