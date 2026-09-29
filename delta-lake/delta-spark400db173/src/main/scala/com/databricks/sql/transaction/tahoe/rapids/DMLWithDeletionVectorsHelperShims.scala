@@ -77,7 +77,7 @@ private[rapids] object DMLWithDeletionVectorsHelperShims {
         val newBaseRelation = hfsr.copy(
           location = fileIndex,
           dataSchema = newDataSchema,
-          fileFormat = format.copy(optimizationsEnabled = true))(hfsr.sparkSession)
+          fileFormat = format.copyWithDVInfo(fileIndex.path.toString, true))(hfsr.sparkSession)
         relation.copy(relation = newBaseRelation, output = relation.output :+ rowIndexCol)
       case project @ Project(projectList, _) =>
         project.copy(projectList = projectList :+ rowIndexCol)

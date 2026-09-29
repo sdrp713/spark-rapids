@@ -53,6 +53,11 @@ object GpuDeltaParquetFileFormatBase {
 
   private[delta] def findGpuRowIndexColumn(schema: StructType): Int =
     schema.fields.indexWhere(isGpuRowIndexColumn)
+
+  private[delta] def findGpuRowIndexColumn(schema: StructType, nativeName: String): Int = {
+    val markedIndex = findGpuRowIndexColumn(schema)
+    if (markedIndex >= 0) markedIndex else schema.fieldNames.indexOf(nativeName)
+  }
 }
 
 abstract class GpuDeltaParquetFileFormatBase extends GpuReadParquetFileFormat {
