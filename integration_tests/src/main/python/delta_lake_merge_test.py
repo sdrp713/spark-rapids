@@ -1308,9 +1308,13 @@ def test_delta_merge_deletion_vector_db173(spark_tmp_path, spark_tmp_table_facto
         merge_sql=merge_sql, compare_logs=False, conf=conf)
 
 
-@allow_non_gpu("ExecutedCommandExec", *delta_meta_allow)
+@allow_non_gpu("ExecutedCommandExec,BroadcastHashJoinExec,ColumnarToRowExec,"
+               "BroadcastExchangeExec,DataWritingCommandExec",
+               delta_write_fallback_allow, *delta_meta_allow)
 @delta_lake
 @ignore_order
+@allow_non_gpu_delta_write_if(
+    True, reason="the command runs on the CPU by design; its jobs are planned by the plugin")
 @pytest.mark.skipif(not is_databricks173_or_later(),
                     reason="DBR 17.3 persistent-DV eligibility fallback coverage")
 @pytest.mark.parametrize("command", ["DELETE", "UPDATE", "MERGE"])
