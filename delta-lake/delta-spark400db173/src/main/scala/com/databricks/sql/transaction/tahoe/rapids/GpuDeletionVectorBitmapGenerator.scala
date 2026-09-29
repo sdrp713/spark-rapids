@@ -17,7 +17,7 @@
 package com.databricks.sql.transaction.tahoe.rapids
 
 import com.databricks.sql.transaction.tahoe.OptimisticTransaction
-import com.databricks.sql.transaction.tahoe.actions.{AddFile, FileAction}
+import com.databricks.sql.transaction.tahoe.actions.{AddFile, FileAction, RemoveFile}
 import com.databricks.sql.transaction.tahoe.commands.{
   DeletionVectorBitmapGenerator,
   DMLWithDeletionVectorsHelper,
@@ -67,6 +67,17 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       txn: OptimisticTransaction): (Seq[FileAction], Map[String, Long]) = {
     val (actions, metrics) =
       DMLWithDeletionVectorsHelper.processUnmodifiedData(spark, touchedFiles, txn.snapshot)
-    (actions, metrics)
+    // DBR rehydrates the replacement AddFile stats from the snapshot, but the paired RemoveFile
+    // can retain the numRecords-only stats from the data-skipping candidate. Both actions describe
+    // the same logical file state, so carry DBR's native wide-bound stats onto the remove action.
+    val addStatsByPath = actions.collect {
+      case add: AddFile if add.stats != null => add.path -> add.stats
+    }.toMap
+    val actionsWithStats = actions.map {
+      case remove: RemoveFile if addStatsByPath.contains(remove.path) =>
+        remove.copy(stats = addStatsByPath(remove.path))
+      case action => action
+    }
+    (actionsWithStats, metrics)
   }
 }
