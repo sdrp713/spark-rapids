@@ -680,8 +680,8 @@ case class GpuDeltaParquetFileFormatNativeDV(
         clippedBlocks.toSeq, isCaseSensitive, debugDumpPrefix, debugDumpAlways,
         maxReadBatchSizeRows, maxReadBatchSizeBytes, targetBatchSizeBytes,
         maxGpuColumnSizeBytes, useChunkedReader, maxChunkedReaderMemoryUsageSizeBytes,
-        skipReadEstimate, compressCfg, metrics, partitionSchema, poolConf, ignoreMissingFiles,
-        ignoreCorruptFiles, readUseFieldId, tablePathOpt)
+        skipReadEstimate, compressCfg, metrics, readDataSchema, partitionSchema, poolConf,
+        ignoreMissingFiles, ignoreCorruptFiles, readUseFieldId, tablePathOpt)
     }
   }
 
@@ -1211,6 +1211,7 @@ case class GpuDeltaParquetFileFormatNativeDV(
       skipReadEstimate: Boolean,
       compressCfg: CpuCompressionConfig,
       execMetrics: Map[String, GpuMetric],
+      readDataSchema: StructType,
       partitionSchema: StructType,
       poolConf: ThreadPoolConf,
       ignoreMissingFiles: Boolean,
@@ -1221,6 +1222,9 @@ case class GpuDeltaParquetFileFormatNativeDV(
       isSchemaCaseSensitive, maxReadBatchSizeRows, maxReadBatchSizeBytes, targetBatchSizeBytes,
       maxGpuColumnSizeBytes, skipReadEstimate, compressCfg, execMetrics, partitionSchema,
       poolConf, ignoreMissingFiles, ignoreCorruptFiles) {
+
+    private val needsPhysicalRowIndex =
+      GpuDeltaParquetFileFormatBase.findGpuRowIndexColumn(readDataSchema) >= 0
 
     override protected def augmentChunkMeta(meta: CurrentChunkMeta): CurrentChunkMeta = {
       if (meta.currentChunk.isEmpty) return meta
@@ -1319,15 +1323,15 @@ case class GpuDeltaParquetFileFormatNativeDV(
      * Loads DV bitmaps for all files in the batch concurrently after the copy phase.
      * Also computes the rows remaining in each partition after applying all of its deletion
      * vectors (used later by [[getRowsPerPartition]]).
-     * Fast path: if no file in the batch has a DV, returns meta unchanged.
+     * Fast path: if no file has a DV and no physical row index was requested, returns unchanged.
      */
     override protected def prepareForDecode(meta: CurrentChunkMeta): CurrentChunkMeta = {
       val batchExtra = meta.extraInfo.asInstanceOf[DeltaBatchExtraInfo]
-      if (!batchExtra.hasDeletionVectors) return meta
+      if (!batchExtra.hasDeletionVectors && !needsPhysicalRowIndex) return meta
 
       val tp = tablePathOpt.getOrElse(
         throw new IllegalStateException(
-          "tablePath must be set when deletion vectors are present"))
+          "tablePath must be set when deletion-vector decoding is required"))
 
       // Submit all DV load tasks concurrently before awaiting any result.
       val threadPool = MultiFileReaderThreadPool.getOrCreateThreadPool(poolConf)
@@ -1423,9 +1427,9 @@ case class GpuDeltaParquetFileFormatNativeDV(
       val parseOpts = getParquetOptions(readDataSchema, clippedSchema, useFieldId)
       GpuSemaphore.acquireIfNecessary(TaskContext.get())
 
-      if (batchExtra.hasDeletionVectors) {
+      if (batchExtra.hasDeletionVectors || needsPhysicalRowIndex) {
         require(tablePathOpt.isDefined,
-          "tablePath must be set when a deletion vector descriptor is present")
+          "tablePath must be set when deletion-vector decoding is required")
         // loadedDVResults is parallel to perFileEntries: one bitmap per file in batch order.
         val dvInfos = batchExtra.loadedDVResults
           .zip(batchExtra.perFileEntries)
