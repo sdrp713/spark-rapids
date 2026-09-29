@@ -25,6 +25,7 @@ import com.databricks.sql.transaction.tahoe.commands.{
 }
 
 import org.apache.spark.sql.{Column, SparkSession}
+import org.apache.spark.sql.functions.{count, countDistinct, lit, max, min}
 import org.apache.spark.sql.nvidia.DFUDFShims
 
 private[rapids] object GpuDeletionVectorBitmapGenerator {
@@ -44,6 +45,14 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       nameToAddFileMap: Map[String, AddFile]): Seq[TouchedFileWithDV] = {
     val gpuTargetDf = DMLWithDeletionVectorsHelperShims.withGpuExecutionContext(
       spark, targetScan.dataFrame)
+    // Temporary diagnostics for the DBR 17.3 target scan. Remove after identifying where the
+    // physical row-index records disappear.
+    val diagnostic = gpuTargetDf.filter(condition).agg(
+      count(lit(1)).as("matchedRows"),
+      count(targetScan.rowIndexColumn).as("nonNullRowIndexes"),
+      countDistinct(targetScan.filePathColumn).as("distinctFiles"),
+      min(targetScan.rowIndexColumn).as("minRowIndex"),
+      max(targetScan.rowIndexColumn).as("maxRowIndex")).head()
     val candidatesHaveDVs =
       hasReadableDVs && candidateFiles.exists(_.deletionVector != null)
     val storedResults = DeletionVectorBitmapGenerator
@@ -57,8 +66,17 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
         Some(targetScan.filePathColumn),
         Some(targetScan.rowIndexColumn))
 
-    DMLWithDeletionVectorsHelper.findFilesWithMatchingRows(
+    val touchedFiles = DMLWithDeletionVectorsHelper.findFilesWithMatchingRows(
       txn, nameToAddFileMap, storedResults)
+    throw new IllegalStateException(
+      s"DBR GPU DV diagnostic: candidateFiles=${candidateFiles.size}, " +
+        s"matchedRows=${diagnostic.getLong(0)}, " +
+        s"nonNullRowIndexes=${diagnostic.getLong(1)}, " +
+        s"distinctFiles=${diagnostic.getLong(2)}, " +
+        s"minRowIndex=${Option(diagnostic.get(3)).getOrElse("null")}, " +
+        s"maxRowIndex=${Option(diagnostic.get(4)).getOrElse("null")}, " +
+        s"storedResults=${storedResults.size}, touchedFiles=${touchedFiles.size}, " +
+        s"modifiedRows=${touchedFiles.map(_.numberOfModifiedRows).sum}")
   }
 
   def processUnmodifiedData(
