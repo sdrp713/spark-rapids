@@ -1768,9 +1768,13 @@ def test_delta_merge_dv_internal_file_path_name_collisions(
         merge_sql=merge_sql, compare_logs=True, conf=delta_merge_enabled_conf)
 
 
-@allow_non_gpu("ExecutedCommandExec", *delta_meta_allow)
+@allow_non_gpu("ExecutedCommandExec,BroadcastHashJoinExec,ColumnarToRowExec,"
+               "BroadcastExchangeExec,DataWritingCommandExec",
+               delta_write_fallback_allow, *delta_meta_allow)
 @delta_lake
 @ignore_order
+@allow_non_gpu_delta_write_if(
+    True, reason="the persistent-DV name collision falls back by design")
 @pytest.mark.skipif(
     not (is_databricks173_or_later() or
          (not is_databricks_runtime() and not is_before_spark_353())),
@@ -1820,6 +1824,11 @@ def test_delta_dml_dv_internal_row_index_column_handling(
                 "WHEN MATCHED THEN UPDATE SET t.v = s.v").collect()
 
     with_cpu_session(setup_tables)
+    if use_persistent_dv:
+        assert_gpu_fallback_write(
+            write_func, read_delta_path, data_path, "ExecutedCommandExec", conf=conf)
+        return
+
     cpu_result = with_cpu_session(
         lambda spark: write_func(spark, data_path + "/CPU"), conf=conf)
     expected_commands = {
