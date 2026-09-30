@@ -132,6 +132,7 @@ def _execute(spark, sql, command, engine, label, capture):
     try:
         if capture:
             callback.startCapture()
+        _emit("phase", phase="dml", label=label, engine=engine)
         start = time.perf_counter()
         result = [row.asDict() for row in spark.sql(sql).collect()]
         seconds = time.perf_counter() - start
@@ -168,9 +169,12 @@ def _validate(spark, base, version, cpu, gpu, command, threshold, expected_rows)
                                        .otherwise(f.col("v")))
     cpu_df = spark.read.format("delta").load(cpu).select(expected.columns)
     gpu_df = spark.read.format("delta").load(gpu).select(expected.columns)
+    _emit("phase", phase="validation_counts", cpu=cpu, gpu=gpu)
     assert cpu_df.count() == gpu_df.count() == expected_rows
     # Equal cardinalities plus a one-way multiset difference imply multiset equality.
+    _emit("phase", phase="validation_expected_vs_cpu", cpu=cpu)
     assert expected.exceptAll(cpu_df).limit(1).count() == 0, "CPU differs from expected rows"
+    _emit("phase", phase="validation_cpu_vs_gpu", cpu=cpu, gpu=gpu)
     assert cpu_df.exceptAll(gpu_df).limit(1).count() == 0, "CPU/GPU rows differ"
 
 
@@ -184,6 +188,10 @@ def _environment(spark):
             "spark.databricks.photon.enabled"]
     return dict(spark_version=spark.version, master=sc.master, app_id=sc.applicationId,
                 default_parallelism=sc.defaultParallelism,
+                jvm_max_heap_bytes=sc._jvm.java.lang.Runtime.getRuntime().maxMemory(),
+                parquet_reader={key: spark.conf.get(key) for key in (
+                    "spark.sql.parquet.columnarReaderBatchSize",
+                    "spark.sql.parquet.enableVectorizedReader")},
                 startup={key: sc.getConf().get(key, "<unset>") for key in keys},
                 session=CONF)
 
@@ -282,6 +290,14 @@ def _run(request, settings, scale):
 
 def test_dv_dml_benchmark_pilot(request):
     _run(request, PILOT, "pilot")
+
+
+@pytest.mark.parametrize("shuffle_partitions", [128, 8], ids=["shuffle128", "shuffle8"])
+def test_dv_dml_benchmark_shuffle_pilot(request, monkeypatch, shuffle_partitions):
+    # Six measured pairs give each engine three first/second positions.
+    # Override the benchmark session configuration, not just Spark startup defaults.
+    monkeypatch.setitem(CONF, "spark.sql.shuffle.partitions", str(shuffle_partitions))
+    _run(request, dict(PILOT, repeats=6), f"pilot-shuffle{shuffle_partitions}")
 
 
 def test_dv_dml_benchmark_full(request):
