@@ -420,7 +420,7 @@ else
     export PYSP_TEST_spark_sql_shuffle_partitions='4'
     # prevent cluster shape to change
     export PYSP_TEST_spark_dynamicAllocation_enabled='false'
-    export PYSP_TEST_spark_rapids_memory_host_spillStorageSize='100m'
+    export PYSP_TEST_spark_rapids_memory_host_spillStorageSize=${PYSP_TEST_spark_rapids_memory_host_spillStorageSize:-100m}
     # Not the default 2G but should be large enough for a single batch for all data (we found
     # 200 MiB being allocated by a single test at most, and we typically have 4 tasks.
     export PYSP_TEST_spark_rapids_sql_batchSizeBytes='100m'
