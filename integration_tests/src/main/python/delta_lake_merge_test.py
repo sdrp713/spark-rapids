@@ -1344,8 +1344,8 @@ def test_delta_merge_deletion_vector_removed_file_metrics(
     gpu_metrics = with_cpu_session(
         lambda spark: history_metrics(spark, data_path + "/GPU"), conf=conf)
     assert cpu_metrics == gpu_metrics, f"CPU {cpu_metrics} vs GPU {gpu_metrics}"
-    assert gpu_metrics == {"numTargetBytesRemoved": 0,
-                           "numTargetPartitionsRemovedFrom": 0}
+    assert gpu_metrics["numTargetBytesRemoved"] > 0
+    assert gpu_metrics["numTargetPartitionsRemovedFrom"] == 0
 
 
 @allow_non_gpu("ExecutedCommandExec,BroadcastHashJoinExec,ColumnarToRowExec,"

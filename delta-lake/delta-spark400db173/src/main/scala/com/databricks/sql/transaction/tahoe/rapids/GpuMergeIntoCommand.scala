@@ -774,10 +774,7 @@ case class GpuMergeIntoCommand(
           .set(metricMap.getOrElse("numDeletionVectorsUpdated", 0L))
         metrics("numTargetFilesRemoved").set(metricMap.getOrElse("numRemovedFiles", 0L))
 
-        val removedPaths = dvActions.collect { case remove: RemoveFile => remove.path }.toSet
-        val replacementPaths = dvActions.collect { case add: AddFile => add.path }.toSet
-        val fullyRemovedPaths = removedPaths -- replacementPaths
-        val fullyRemovedFiles = filesToRewrite.filter(file => fullyRemovedPaths.contains(file.path))
+        val fullyRemovedFiles = touchedFiles.filter(_.isFullyReplaced()).map(_.fileLogEntry)
         val (removedBytes, removedPartitions) =
           totalBytesAndDistinctPartitionValues(fullyRemovedFiles)
         metrics("numTargetBytesRemoved").set(removedBytes)
