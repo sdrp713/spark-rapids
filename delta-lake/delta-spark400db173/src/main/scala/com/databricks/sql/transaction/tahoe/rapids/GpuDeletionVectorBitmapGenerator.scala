@@ -65,8 +65,12 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       spark: SparkSession,
       touchedFiles: Seq[TouchedFileWithDV],
       txn: OptimisticTransaction): (Seq[FileAction], Map[String, Long]) = {
-    val (actions, metrics) =
+    // This helper works on file actions and snapshot statistics, not table rows. Keeping its
+    // metadata joins on CPU avoids GPU broadcasts/transfers and CPU JSON bridges for small
+    // driver-originated datasets. Bitmap generation above and subsequent DML remain GPU-enabled.
+    val (actions, metrics) = GpuDeltaCpuFallback.withRapidsDisabled(spark) {
       DMLWithDeletionVectorsHelper.processUnmodifiedData(spark, touchedFiles, txn.snapshot)
+    }
     // DBR rehydrates the replacement AddFile stats from the snapshot, but the paired RemoveFile
     // can retain the numRecords-only stats from the data-skipping candidate. Both actions describe
     // the same logical file state, so carry DBR's native wide-bound stats onto the remove action.

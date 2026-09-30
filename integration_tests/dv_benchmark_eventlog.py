@@ -101,6 +101,34 @@ def emit(kind, **fields):
     print("DV_PROFILE " + json.dumps(dict(kind=kind, **fields), sort_keys=True))
 
 
+def select_jobs(jobs, operation, trial):
+    execution_groups = {}
+    for job in jobs.values():
+        properties = job.get("Properties") or {}
+        group = properties.get("spark.jobGroup.id", "")
+        parts = group.split("/")
+        if (len(parts) == 5 and parts[0] == "DV_BENCH"
+                and parts[2].startswith(operation + "-") and parts[3] == str(trial)):
+            execution = properties.get("spark.sql.execution.id")
+            if execution is not None:
+                execution_groups[str(execution)] = group
+    selected = []
+    for job_id, job in sorted(jobs.items()):
+        properties = job.get("Properties") or {}
+        group = properties.get("spark.jobGroup.id", "")
+        parts = group.split("/")
+        if (len(parts) == 5 and parts[0] == "DV_BENCH"
+                and parts[2].startswith(operation + "-") and parts[3] == str(trial)):
+            selected.append((job_id, job, properties, group))
+        elif not group:
+            # GPU broadcast jobs can retain the SQL execution ID but not the job group.
+            # Do not reassociate jobs that explicitly belong to another group.
+            inferred = execution_groups.get(str(properties.get("spark.sql.execution.id")))
+            if inferred:
+                selected.append((job_id, job, properties, inferred))
+    return selected
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("eventlog", type=Path)
@@ -114,14 +142,7 @@ def main():
     if not paths:
         parser.error("No Spark event files found; supply the eventlog directory or event file")
     jobs, ends, stages, tasks, sql = read_profile(paths)
-    selected = []
-    for job_id, job in sorted(jobs.items()):
-        properties = job.get("Properties") or {}
-        group = properties.get("spark.jobGroup.id", "")
-        parts = group.split("/")
-        if (len(parts) == 5 and parts[0] == "DV_BENCH"
-                and parts[2].startswith(args.operation + "-") and parts[3] == str(args.trial)):
-            selected.append((job_id, job, properties, group))
+    selected = select_jobs(jobs, args.operation, args.trial)
     if not selected:
         parser.error("No matching DV_BENCH jobs; check operation, trial, and eventlog path")
     emit("notes", files=[str(path) for path in paths],
@@ -134,6 +155,7 @@ def main():
         execution = properties.get("spark.sql.execution.id", "")
         emit("job", group=group, job_id=job_id, start_ms=job["Submission Time"],
              elapsed_ms=elapsed, stage_ids=job["Stage IDs"],
+             attributed_by="job_group" if properties.get("spark.jobGroup.id") else "sql_execution",
              result=end.get("Job Result"), sql_id=execution, sql=sql.get(execution))
     selected_stages = {stage for _, job, _, _ in selected for stage in job["Stage IDs"]}
     for key, info in sorted(stages.items()):

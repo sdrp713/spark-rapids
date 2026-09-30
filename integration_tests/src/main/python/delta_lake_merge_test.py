@@ -1308,6 +1308,102 @@ def test_delta_merge_deletion_vector_db173(spark_tmp_path, spark_tmp_table_facto
         merge_sql=merge_sql, compare_logs=False, conf=conf)
 
 
+@allow_non_gpu("ColumnarToRowExec", *delta_meta_allow)
+@delta_lake
+@ignore_order
+@pytest.mark.skipif(not is_databricks173_or_later(),
+                    reason="DBR 17.3 native DV metadata processing")
+@pytest.mark.parametrize("command", ["DELETE", "UPDATE", "MERGE"])
+def test_delta_dml_dv_metadata_cpu_scope(spark_tmp_path, command):
+    conf = copy_and_update(delta_merge_enabled_conf, {
+        "spark.rapids.sql.command.DeleteCommand": "true",
+        "spark.rapids.sql.command.DeleteCommandEdge": "true",
+        "spark.rapids.sql.command.UpdateCommand": "true",
+        "spark.rapids.sql.command.UpdateCommandEdge": "true",
+        "spark.databricks.delta.delete.deletionVectors.persistent": "true",
+        "spark.databricks.delta.update.deletionVectors.persistent": "true",
+        "spark.databricks.delta.merge.deletionVectors.persistent": "true",
+        "spark.databricks.delta.deletionVectors.useMetadataRowIndex": "true",
+        "spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "true",
+        "spark.databricks.delta.autoCompact.enabled": "false",
+        "spark.databricks.delta.optimizeWrite.enabled": "false",
+    })
+    paths = {engine: spark_tmp_path + "/" + engine for engine in ("CPU", "GPU")}
+
+    def setup(spark):
+        for path in paths.values():
+            spark.range(1024, numPartitions=2).withColumn("v", f.col("id") * 7) \
+                .write.format("delta") \
+                .option("delta.enableDeletionVectors", "true") \
+                .option("delta.enableRowTracking", "false") \
+                .option("delta.autoOptimize.autoCompact", "false") \
+                .option("delta.autoOptimize.optimizeWrite", "false").save(path)
+            spark.sql(f"DELETE FROM delta.`{path}` WHERE pmod(id, 4) = 3").collect()
+
+    with_cpu_session(setup, conf=conf)
+    callback = spark_jvm().org.apache.spark.sql.rapids.ExecutionPlanCaptureCallback
+    gpu_command = "Gpu" + ("MergeInto" if command == "MERGE" else command.title()) + "Command"
+
+    def run(spark, path, remainder):
+        enabled_before = spark.conf.get("spark.rapids.sql.enabled")
+        predicate = f"pmod(id, 4) = {remainder}"
+        if command == "DELETE":
+            sql = f"DELETE FROM delta.`{path}` WHERE {predicate}"
+        elif command == "UPDATE":
+            sql = f"UPDATE delta.`{path}` SET v = v + 10 WHERE {predicate}"
+        else:
+            sql = (f"MERGE INTO delta.`{path}` AS t "
+                   f"USING (SELECT id FROM range(1024) WHERE {predicate}) AS s "
+                   "ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.v = t.v + 10")
+        result = spark.sql(sql).collect()
+        assert spark.conf.get("spark.rapids.sql.enabled") == enabled_before
+        return result
+
+    # Two operations on existing DVs verify that the metadata scope does not disable later DML.
+    for remainder in (0, 1):
+        cpu_result = with_cpu_session(
+            lambda spark: run(spark, paths["CPU"], remainder), conf=conf)
+        callback.startCapture()
+        try:
+            gpu_result = with_gpu_session(
+                lambda spark: run(spark, paths["GPU"], remainder), conf=conf)
+            plans = list(callback.getResultsWithTimeout(10000))
+        finally:
+            callback.endCapture()
+        assert_equal(cpu_result, gpu_result)
+        assert any(callback.contains(plan, gpu_command) for plan in plans)
+        assert any(callback.contains(plan, "GpuFileSourceScanExec") for plan in plans)
+        if command != "DELETE":
+            assert any(callback.contains(plan, "RapidsDeltaWrite") for plan in plans)
+
+        metadata_joins = []
+        for plan in plans:
+            output = plan.output().iterator()
+            names = set()
+            while output.hasNext():
+                names.add(output.next().name())
+            # File-statistics results, not a user-table join or the file-to-DV lookup.
+            if {"path", "stats"}.issubset(names) and (
+                    callback.contains(plan, "BroadcastHashJoinExec") or
+                    callback.contains(plan, "GpuBroadcastHashJoinExec")):
+                metadata_joins.append(plan)
+        assert metadata_joins, "No native DV statistics join captured"
+        for plan in metadata_joins:
+            assert not callback.contains(plan, "GpuBroadcastHashJoinExec"), str(plan)
+
+    for path in paths.values():
+        def check_dvs(spark):
+            history = spark.sql(f"DESCRIBE HISTORY delta.`{path}`").orderBy(
+                f.desc("version")).first()
+            prefix = "numTargetDeletionVectors" if command == "MERGE" else "numDeletionVectors"
+            assert int(history["operationMetrics"].get(prefix + "Updated", 0)) > 0
+        with_cpu_session(check_dvs, conf=conf)
+    cpu_rows, gpu_rows = [with_cpu_session(
+        lambda spark: spark.read.format("delta").load(path).orderBy("id").collect(), conf=conf)
+        for path in paths.values()]
+    assert_equal(cpu_rows, gpu_rows)
+
+
 @allow_non_gpu(*delta_meta_allow)
 @delta_lake
 @ignore_order
