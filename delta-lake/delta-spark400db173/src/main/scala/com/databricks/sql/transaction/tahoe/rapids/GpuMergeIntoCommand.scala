@@ -28,7 +28,7 @@ import scala.collection.JavaConverters._
 import scala.collection.mutable
 
 import com.databricks.sql.transaction.tahoe._
-import com.databricks.sql.transaction.tahoe.actions.{AddCDCFile, AddFile, FileAction, RemoveFile}
+import com.databricks.sql.transaction.tahoe.actions.{AddCDCFile, AddFile, FileAction}
 import com.databricks.sql.transaction.tahoe.commands.{DeletionVectorUtils, DeltaCommand}
 import com.databricks.sql.transaction.tahoe.commands.merge.MergeIntoMaterializeSource
 import com.databricks.sql.transaction.tahoe.files.{TahoeBatchFileIndex, TahoeFileIndex}
