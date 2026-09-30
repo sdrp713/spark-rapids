@@ -775,6 +775,23 @@ case class GpuMergeIntoCommand(
         metrics("numTargetFilesRemoved").set(metricMap.getOrElse("numRemovedFiles", 0L))
 
         val fullyRemovedFiles = touchedFiles.filter(_.isFullyReplaced()).map(_.fileLogEntry)
+        if (touchedFiles.nonEmpty && fullyRemovedFiles.isEmpty) {
+          val details = touchedFiles.map { touched =>
+            val file = touched.fileLogEntry
+            val existingDvCardinality =
+              Option(file.deletionVector).map(_.cardinality).getOrElse(0L)
+            val newDvCardinality =
+              Option(touched.newDeletionVector).map(_.cardinality).getOrElse(0L)
+            s"path=${file.path}, size=${file.size}, stats=${file.stats}, " +
+              s"deletedRows=${touched.deletedRows}, " +
+              s"modifiedRows=${touched.numberOfModifiedRows}, " +
+              s"existingDvCardinality=$existingDvCardinality, " +
+              s"newDvCardinality=$newDvCardinality, " +
+              s"fullyReplaced=${touched.isFullyReplaced()}"
+          }
+          throw new IllegalStateException(
+            s"DBR GPU MERGE DV metric diagnostic: ${details.mkString("; ")}")
+        }
         val (removedBytes, removedPartitions) =
           totalBytesAndDistinctPartitionValues(fullyRemovedFiles)
         metrics("numTargetBytesRemoved").set(removedBytes)
