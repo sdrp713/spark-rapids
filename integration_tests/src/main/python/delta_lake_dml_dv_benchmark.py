@@ -182,7 +182,9 @@ def _environment(spark):
     sc = spark.sparkContext
     keys = ["spark.driver.memory", "spark.executor.memory", "spark.executor.cores",
             "spark.executor.instances", "spark.plugins", "spark.jars",
+            "spark.eventLog.enabled", "spark.eventLog.dir", "spark.eventLog.compress",
             "spark.rapids.memory.host.spillStorageSize", "spark.rapids.sql.batchSizeBytes",
+            "spark.rapids.memory.gpu.allocSize",
             "spark.rapids.sql.concurrentGpuTasks", "spark.dynamicAllocation.enabled",
             "spark.databricks.clusterUsageTags.sparkVersion",
             "spark.databricks.photon.enabled"]
