@@ -36,6 +36,7 @@ pytestmark = [pytest.mark.delta_lake, pytest.mark.allow_non_gpu(any=True),
 
 # Benchmark inputs, not plugin configuration. Increase full-scale rows if scans are too short.
 PILOT = dict(rows=1_000_000, files=8, repeats=1, thresholds=[1], existing_dvs=[True])
+MEDIUM = dict(rows=10_000_000, files=32, repeats=3, thresholds=[1], existing_dvs=[True])
 FULL = dict(rows=50_000_000, files=128, repeats=5,
             thresholds=[1, 100], existing_dvs=[False, True])
 MODULUS = 1000
@@ -300,6 +301,11 @@ def test_dv_dml_benchmark_shuffle_pilot(request, monkeypatch, shuffle_partitions
     # Override the benchmark session configuration, not just Spark startup defaults.
     monkeypatch.setitem(CONF, "spark.sql.shuffle.partitions", str(shuffle_partitions))
     _run(request, dict(PILOT, repeats=6), f"pilot-shuffle{shuffle_partitions}")
+
+
+def test_dv_dml_benchmark_medium(request, monkeypatch):
+    monkeypatch.setitem(CONF, "spark.sql.shuffle.partitions", "32")
+    _run(request, MEDIUM, "medium-shuffle32")
 
 
 def test_dv_dml_benchmark_full(request):
