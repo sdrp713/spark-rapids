@@ -38,6 +38,8 @@ pytestmark = [pytest.mark.delta_lake, pytest.mark.allow_non_gpu(any=True),
 PILOT = dict(rows=1_000_000, files=8, repeats=1, thresholds=[1], existing_dvs=[True])
 # The 32-file medium run triggered a post-MERGE CPU OPTIMIZE; retain the pilot's file count.
 MEDIUM = dict(rows=10_000_000, files=8, repeats=3, thresholds=[1], existing_dvs=[True])
+# Approximate the 10% changed-row density reported in the OSS DML benchmark.
+MEDIUM_DENSE = dict(MEDIUM, thresholds=[100])
 FULL = dict(rows=50_000_000, files=128, repeats=5,
             thresholds=[1, 100], existing_dvs=[False, True])
 MODULUS = 1000
@@ -141,7 +143,11 @@ def _execute(spark, sql, command, engine, label, capture):
         if capture:
             plans = list(callback.getResultsWithTimeout(10000))
             classes = ["GpuDeleteCommand", "GpuUpdateCommand", "GpuMergeIntoCommand",
-                       "GpuFileSourceScanExec", "FileSourceScanExec", "RapidsDeltaWrite"]
+                       "GpuFileSourceScanExec", "FileSourceScanExec", "RapidsDeltaWrite",
+                       "GpuHashAggregateExec", "ObjectHashAggregateExec",
+                       "GpuRowToColumnarExec", "GpuColumnarToRowExec",
+                       "MapPartitionsExec", "DeserializeToObjectExec",
+                       "SerializeFromObjectExec", "LocalTableScanExec"]
             present = [name for name in classes
                        if any(callback.contains(plan, name) for plan in plans)]
             _emit("plans", label=label, engine=engine, classes=present,
@@ -307,6 +313,11 @@ def test_dv_dml_benchmark_shuffle_pilot(request, monkeypatch, shuffle_partitions
 def test_dv_dml_benchmark_medium(request, monkeypatch):
     monkeypatch.setitem(CONF, "spark.sql.shuffle.partitions", "8")
     _run(request, MEDIUM, "medium-shuffle8")
+
+
+def test_dv_dml_benchmark_medium_dense(request, monkeypatch):
+    monkeypatch.setitem(CONF, "spark.sql.shuffle.partitions", "8")
+    _run(request, MEDIUM_DENSE, "medium-dense-shuffle8")
 
 
 def test_dv_dml_benchmark_full(request):
