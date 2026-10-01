@@ -1338,7 +1338,8 @@ def test_delta_dml_dv_metadata_cpu_scope(spark_tmp_path, command):
                 .option("delta.enableRowTracking", "false") \
                 .option("delta.autoOptimize.autoCompact", "false") \
                 .option("delta.autoOptimize.optimizeWrite", "false").save(path)
-            spark.sql(f"DELETE FROM delta.`{path}` WHERE pmod(id, 4) = 3").collect()
+            # Keep DV density below the runtime's 20% compaction threshold across all operations.
+            spark.sql(f"DELETE FROM delta.`{path}` WHERE pmod(id, 64) = 63").collect()
 
     with_cpu_session(setup, conf=conf)
     callback = spark_jvm().org.apache.spark.sql.rapids.ExecutionPlanCaptureCallback
@@ -1346,7 +1347,7 @@ def test_delta_dml_dv_metadata_cpu_scope(spark_tmp_path, command):
 
     def run(spark, path, remainder):
         enabled_before = spark.conf.get("spark.rapids.sql.enabled")
-        predicate = f"pmod(id, 4) = {remainder}"
+        predicate = f"pmod(id, 16) = {remainder}"
         if command == "DELETE":
             sql = f"DELETE FROM delta.`{path}` WHERE {predicate}"
         elif command == "UPDATE":
@@ -1393,10 +1394,13 @@ def test_delta_dml_dv_metadata_cpu_scope(spark_tmp_path, command):
 
     for path in paths.values():
         def check_dvs(spark):
-            history = spark.sql(f"DESCRIBE HISTORY delta.`{path}`").orderBy(
-                f.desc("version")).first()
+            history = spark.sql(f"DESCRIBE HISTORY delta.`{path}`") \
+                .where(f.col("operation") == command).orderBy(f.desc("version")).first()
+            assert history is not None, f"No {command} history entry for {path}"
             prefix = "numTargetDeletionVectors" if command == "MERGE" else "numDeletionVectors"
-            assert int(history["operationMetrics"].get(prefix + "Updated", 0)) > 0
+            metrics = history["operationMetrics"]
+            assert int(metrics.get(prefix + "Updated", 0)) > 0, \
+                f"{command} at {path} has no updated DVs: {metrics}"
         with_cpu_session(check_dvs, conf=conf)
     cpu_rows, gpu_rows = [with_cpu_session(
         lambda spark: spark.read.format("delta").load(path).orderBy("id").collect(), conf=conf)
