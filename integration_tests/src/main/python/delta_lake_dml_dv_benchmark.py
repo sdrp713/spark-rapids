@@ -16,9 +16,12 @@
 
 All table generation, cloning, plan inspection, and validation are outside the timer.
 Artifacts are retained in a unique child of pytest's explicit --tmp_path.
+The store_sales variant expects a separately validated local Parquet sample in
+<--tmp_path>/raw; it is never part of automatic integration-test discovery.
 """
 
 import json
+import os
 import statistics
 import time
 import uuid
@@ -42,6 +45,8 @@ MEDIUM = dict(rows=10_000_000, files=8, repeats=3, thresholds=[1], existing_dvs=
 MEDIUM_DENSE = dict(MEDIUM, thresholds=[100])
 FULL = dict(rows=50_000_000, files=128, repeats=5,
             thresholds=[1, 100], existing_dvs=[False, True])
+STORE_SALES_THRESHOLD = 100  # Match the 10% changed-row density of the OSS comparison.
+STORE_SALES_REPEATS = 3
 MODULUS = 1000
 PAYLOAD_COLUMNS = 4  # Four deterministic SHA-256 strings: 256 payload bytes per row.
 
@@ -90,6 +95,14 @@ def _history(spark, path):
         f.desc("version")).first().asDict(recursive=True)
 
 
+def _command_history(spark, path, command):
+    # DBR can append an OPTIMIZE commit after DML. Inspect the DML commit itself.
+    row = spark.sql(f"DESCRIBE HISTORY {_table(path)}").where(
+        f.col("operation") == command).orderBy(f.desc("version")).first()
+    assert row is not None, f"No {command} commit found at {path}"
+    return row.asDict(recursive=True)
+
+
 def _clone(spark, source, target, version):
     # No replace/overwrite: a collision fails instead of changing an existing table.
     spark.sql(f"CREATE TABLE {_table(target)} SHALLOW CLONE {_table(source)} "
@@ -112,6 +125,22 @@ def _write_base(spark, path, settings):
     return {key: detail[key] for key in ("numFiles", "sizeInBytes")}
 
 
+def _write_store_sales_base(spark, source, path):
+    # Persist the surrogate key once; it is unique even when TPC-DS business keys repeat.
+    df = spark.read.parquet(source).withColumn("id", f.monotonically_increasing_id())
+    assert "ss_quantity" in df.columns and "ss_sold_date_sk" in df.columns, \
+        "Expected a store_sales Parquet sample"
+    df.write.format("delta").mode("errorifexists") \
+        .option("delta.enableDeletionVectors", "true") \
+        .option("delta.enableChangeDataFeed", "false") \
+        .option("delta.enableRowTracking", "false") \
+        .option("delta.autoOptimize.autoCompact", "false") \
+        .option("delta.autoOptimize.optimizeWrite", "false") \
+        .partitionBy("ss_sold_date_sk").save(path)
+    detail = spark.sql(f"DESCRIBE DETAIL {_table(path)}").first().asDict()
+    return {key: detail[key] for key in ("numFiles", "sizeInBytes")}
+
+
 def _assert_dvs(history, command):
     metrics = history["operationMetrics"]
     prefix = "numTargetDeletionVectors" if command == "MERGE" else "numDeletionVectors"
@@ -128,6 +157,17 @@ def _sql(command, path, source_path, threshold):
     # Matched-update MERGE isolates the existing-row/DV path. Source is materialized Parquet.
     return (f"MERGE INTO {_table(path)} AS t USING parquet.`{source_path}` AS s "
             "ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.v = s.v")
+
+
+def _store_sales_sql(command, path, source_path, threshold):
+    predicate = f"pmod(id, {MODULUS}) < {threshold}"
+    if command == "DELETE":
+        return f"DELETE FROM {_table(path)} WHERE {predicate}"
+    if command == "UPDATE":
+        return (f"UPDATE {_table(path)} SET ss_quantity = ss_quantity + 1 "
+                f"WHERE {predicate}")
+    return (f"MERGE INTO {_table(path)} AS t USING parquet.`{source_path}` AS s "
+            "ON t.id = s.id WHEN MATCHED THEN UPDATE SET t.ss_quantity = s.ss_quantity")
 
 
 def _execute(spark, sql, command, engine, label, capture):
@@ -184,6 +224,32 @@ def _validate(spark, base, version, cpu, gpu, command, threshold, expected_rows)
     assert expected.exceptAll(cpu_df).limit(1).count() == 0, "CPU differs from expected rows"
     _emit("phase", phase="validation_cpu_vs_gpu", cpu=cpu, gpu=gpu)
     assert cpu_df.exceptAll(gpu_df).limit(1).count() == 0, "CPU/GPU rows differ"
+
+
+def _store_sales_fingerprint(df):
+    # A full-table aggregate avoids the large shuffle of exceptAll on this 50 GiB input.
+    row_hash = f.xxhash64(*(f.col(name) for name in df.columns))
+    row = df.agg(f.count("*").alias("rows"),
+                 f.sum(row_hash.cast("decimal(38,0)")).alias("hash_sum")).first()
+    return row.asDict()
+
+
+def _validate_store_sales(spark, base, version, cpu, gpu, command, threshold):
+    expected = spark.read.format("delta").option("versionAsOf", version).load(base)
+    predicate = f.pmod(f.col("id"), f.lit(MODULUS)) < threshold
+    if command == "DELETE":
+        expected = expected.where(~predicate)
+    else:
+        expected = expected.withColumn(
+            "ss_quantity", f.when(predicate, f.col("ss_quantity") + 1)
+            .otherwise(f.col("ss_quantity")))
+    signature = _store_sales_fingerprint(expected)
+    for engine, path in (("CPU", cpu), ("GPU", gpu)):
+        actual = spark.read.format("delta").load(path).select(expected.columns)
+        assert _store_sales_fingerprint(actual) == signature, \
+            f"{engine} result differs from the expected store_sales fingerprint"
+    _emit("validated", method="count-and-xxhash64-sum", cpu=cpu, gpu=gpu,
+          rows=signature["rows"])
 
 
 def _environment(spark):
@@ -298,6 +364,114 @@ def _run(request, settings, scale):
     _emit("complete", root=root, scale=scale)
 
 
+def _run_store_sales(request):
+    assert is_databricks173_or_later(), "This benchmark requires the DBR 17.3 DV implementation"
+    assert not hasattr(request.config, "workerinput"), "Set TEST_PARALLEL=0"
+    assert get_inject_oom_conf() is None, "Use --test_oom_injection_mode=never for timings"
+    input_parent = request.config.getoption("tmp_path")
+    assert input_parent and os.path.isabs(input_parent), \
+        "Set --tmp_path to the absolute parent of the downloaded raw directory"
+    source = os.path.join(input_parent, "raw")
+    assert os.path.isdir(source), f"Downloaded store_sales sample not found: {source}"
+    files = [os.path.join(directory, name)
+             for directory, _, names in os.walk(source)
+             for name in names if name.endswith(".parquet")]
+    assert files, f"No Parquet files found under {source}"
+    input_bytes = sum(os.path.getsize(path) for path in files)
+    root = os.path.join(input_parent, "dv-benchmark-" + uuid.uuid4().hex)
+    environment = _session(_environment)
+    scale = "store-sales-local-10pct"
+    _emit("environment", root=root, scale=scale, source=source,
+          input_files=len(files), input_bytes=input_bytes,
+          threshold=STORE_SALES_THRESHOLD, repeats=STORE_SALES_REPEATS, **environment)
+    assert environment["master"].startswith("local["), \
+        "The downloaded sample is driver-local; run Spark in local mode"
+    assert environment["jvm_max_heap_bytes"] >= 8 * 1024 ** 3, \
+        "Use DRIVER_MEMORY=16g and SPARK_SUBMIT_FLAGS='--driver-memory 16g'"
+    assert environment["startup"]["spark.databricks.photon.enabled"].lower() != "true", \
+        "Disable Photon for this CPU/GPU comparison"
+
+    base = root + "/base"
+    detail = _session(lambda spark: _write_store_sales_base(spark, source, base))
+    _emit("base", path=base, clean_version=0, **detail)
+
+    def prepare(spark):
+        df = spark.read.format("delta").load(base)
+        rows = df.count()
+        predicate = f.pmod(f.col("id"), f.lit(MODULUS)) < STORE_SALES_THRESHOLD
+        affected = df.where(predicate).count()
+        assert rows > affected > 0
+        spark.sql(f"DELETE FROM {_table(base)} WHERE pmod(id, {MODULUS}) = "
+                  f"{MODULUS - 1}").collect()
+        seed = _command_history(spark, base, "DELETE")
+        _assert_dvs(seed, "DELETE")
+        seed_deleted = int(seed["operationMetrics"]["numDeletedRows"])
+        assert seed_deleted > 0
+        return rows, affected, seed_deleted, seed["version"]
+
+    rows, affected, seed_deleted, seeded_version = _session(prepare)
+    initial_rows = rows - seed_deleted
+    _emit("seeded", rows=rows, affected_rows=affected, seed_deleted_rows=seed_deleted,
+          version=seeded_version)
+    source_path = root + "/merge-source"
+
+    def write_source(spark):
+        spark.read.format("delta").option("versionAsOf", seeded_version).load(base) \
+            .where(f.pmod(f.col("id"), f.lit(MODULUS)) < STORE_SALES_THRESHOLD) \
+            .select(f.col("id"), (f.col("ss_quantity") + 1).alias("ss_quantity")) \
+            .write.mode("errorifexists").parquet(source_path)
+
+    _session(write_source)
+    for command in ("DELETE", "UPDATE", "MERGE"):
+        case = f"{command}-{STORE_SALES_THRESHOLD}permille-existingdv-True"
+        measured = {engine: [] for engine in ("CPU", "GPU")}
+        paired_speedups = []
+        for trial in range(STORE_SALES_REPEATS + 1):
+            paths = {engine: root + f"/{case}/{trial}/{engine}"
+                     for engine in ("CPU", "GPU")}
+            for path in paths.values():
+                _session(lambda spark: _clone(spark, base, path, seeded_version))
+            order = ("CPU", "GPU") if trial % 2 == 0 else ("GPU", "CPU")
+            results = {}
+            for engine in order:
+                sql = _store_sales_sql(command, paths[engine], source_path,
+                                       STORE_SALES_THRESHOLD)
+                label = f"DV_BENCH/{scale}/{case}/{trial}/{engine}"
+                results[engine] = _session(lambda spark: _execute(
+                    spark, sql, command, engine, label, capture=trial == 0), engine)
+            assert results["CPU"]["result"] == results["GPU"]["result"]
+            row_key = {"DELETE": "numDeletedRows", "UPDATE": "numUpdatedRows",
+                       "MERGE": "numTargetRowsUpdated"}[command]
+            for engine in order:
+                history = _session(lambda spark: _command_history(
+                    spark, paths[engine], command))
+                _assert_dvs(history, command)
+                assert int(history["operationMetrics"][row_key]) == affected
+                _emit("sample", case=case, engine=engine, trial=trial,
+                      warmup=trial == 0, path=paths[engine],
+                      metrics=history["operationMetrics"], **results[engine])
+            if trial == 0:
+                _session(lambda spark: _validate_store_sales(
+                    spark, base, seeded_version, paths["CPU"], paths["GPU"],
+                    command, STORE_SALES_THRESHOLD))
+            if trial > 0:
+                for engine in order:
+                    measured[engine].append(results[engine]["seconds"])
+                paired_speedups.append(results["CPU"]["seconds"] /
+                                       results["GPU"]["seconds"])
+        cpu_median, gpu_median = (statistics.median(measured[engine])
+                                  for engine in ("CPU", "GPU"))
+        _emit("summary", case=case, scale=scale, rows=rows,
+              input_bytes=input_bytes, target_bytes=detail["sizeInBytes"],
+              affected_rows=affected, initial_rows=initial_rows,
+              cpu_seconds=measured["CPU"], gpu_seconds=measured["GPU"],
+              cpu_median=cpu_median, gpu_median=gpu_median,
+              speedup=cpu_median / gpu_median,
+              paired_speedup_median=statistics.median(paired_speedups),
+              paired_speedups=paired_speedups)
+    _emit("complete", root=root, scale=scale)
+
+
 def test_dv_dml_benchmark_pilot(request):
     _run(request, PILOT, "pilot")
 
@@ -322,3 +496,8 @@ def test_dv_dml_benchmark_medium_dense(request, monkeypatch):
 
 def test_dv_dml_benchmark_full(request):
     _run(request, FULL, "full")
+
+
+def test_dv_dml_benchmark_store_sales(request, monkeypatch):
+    monkeypatch.setitem(CONF, "spark.sql.shuffle.partitions", "8")
+    _run_store_sales(request)
