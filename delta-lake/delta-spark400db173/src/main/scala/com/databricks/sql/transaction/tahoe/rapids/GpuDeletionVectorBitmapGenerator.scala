@@ -19,20 +19,19 @@ package com.databricks.sql.transaction.tahoe.rapids
 import com.databricks.sql.transaction.tahoe.OptimisticTransaction
 import com.databricks.sql.transaction.tahoe.actions.{AddFile, FileAction, RemoveFile}
 import com.databricks.sql.transaction.tahoe.commands.{
-  DeletionVectorData,
   DeletionVectorBitmapGenerator,
   DeletionVectorResult,
-  DeletionVectorWriter,
   DMLWithDeletionVectorsHelper,
   TouchedFileWithDV
 }
 import com.databricks.sql.transaction.tahoe.deletionvectors.{RoaringBitmapArray,
   RoaringBitmapArrayFormat}
 import com.databricks.sql.transaction.tahoe.util.{Utils => DeltaUtils}
+import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.paths.SparkPath
-import org.apache.spark.sql.{Column, SparkSession}
+import org.apache.spark.sql.{Column, Encoder, SparkSession}
 import org.apache.spark.sql.functions.{broadcast, col, collect_list, count, lit}
 import org.apache.spark.sql.nvidia.DFUDFShims
 
@@ -42,6 +41,33 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
   private val RowIndexColumn = "__delta_gpu_dv_row_index"
   private val RowIndexesColumn = "__delta_gpu_dv_row_indexes"
   private val MatchCountColumn = "__delta_gpu_dv_match_count"
+  private val DvDataClassName =
+    "com.databricks.sql.transaction.tahoe.commands.DeletionVectorData"
+  private val DvWriterClassName =
+    "com.databricks.sql.transaction.tahoe.commands.DeletionVectorWriter$"
+
+  // DBR's DeletionVectorData signature references a Scala 2.12-only Sizing trait in some
+  // compile jars. Resolve this private API at runtime so the Scala 2.13 compiler need not load it.
+  private def dvDataEncoder: Encoder[AnyRef] =
+    Class.forName(DvDataClassName).getMethod("encoder").invoke(null)
+      .asInstanceOf[Encoder[AnyRef]]
+
+  private def newDvData(path: String, existingDv: Option[String], bitmap: Array[Byte],
+      cardinality: Long): AnyRef = {
+    val constructor = Class.forName(DvDataClassName).getConstructor(
+      classOf[String], classOf[Option[_]], classOf[Array[Byte]], java.lang.Long.TYPE)
+    constructor.newInstance(path, existingDv, bitmap, Long.box(cardinality))
+  }
+
+  private def dvWriter(spark: SparkSession, conf: Configuration, dataPath: Path,
+      prefixLength: Int): Iterator[AnyRef] => Iterator[DeletionVectorResult] = {
+    val writerClass = Class.forName(DvWriterClassName)
+    val module = writerClass.getField("MODULE$").get(null)
+    writerClass.getMethod("createMapperToStoreDeletionVectors", classOf[SparkSession],
+      classOf[Configuration], classOf[Path], java.lang.Integer.TYPE)
+      .invoke(module, spark, conf, dataPath, Int.box(prefixLength))
+      .asInstanceOf[Iterator[AnyRef] => Iterator[DeletionVectorResult]]
+  }
 
   /**
    * DELETE can aggregate matched row indexes by a compact file ID on GPU. DBR's legacy bitmap
@@ -100,14 +126,13 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
         indexes.foreach(bitmap.add)
         bitmap.runOptimize()
         val (_, path, existingDv) = fileMetadata(fileId.toInt)
-        DeletionVectorData(path, existingDv,
+        newDvData(path, existingDv,
           bitmap.serializeAsByteArray(RoaringBitmapArrayFormat.Portable), bitmap.cardinality)
       }
-    }(DeletionVectorData.encoder)
+    }(dvDataEncoder)
     val prefixLength = DeltaUtils.getRandomPrefixLength(txn.metadata)
-    val storedResults = rowIndexData.mapPartitions(
-      DeletionVectorWriter.createMapperToStoreDeletionVectors(
-        spark, txn.deltaLog.newDeltaHadoopConf(), txn.deltaLog.dataPath, prefixLength))(
+    val storedResults = rowIndexData.mapPartitions(dvWriter(spark,
+      txn.deltaLog.newDeltaHadoopConf(), txn.deltaLog.dataPath, prefixLength))(
       DeletionVectorResult.encoder).collect().toSeq
 
     DMLWithDeletionVectorsHelper.findFilesWithMatchingRows(
