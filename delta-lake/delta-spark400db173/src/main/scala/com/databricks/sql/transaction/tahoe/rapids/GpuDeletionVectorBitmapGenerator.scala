@@ -25,6 +25,7 @@ import com.databricks.sql.transaction.tahoe.commands.{
 }
 
 import org.apache.spark.sql.{Column, SparkSession}
+import org.apache.spark.sql.catalyst.expressions.{PythonUDF, SubqueryExpression}
 import org.apache.spark.sql.nvidia.DFUDFShims
 
 private[rapids] object GpuDeletionVectorBitmapGenerator {
@@ -41,11 +42,26 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       targetScan: GpuTargetScan,
       candidateFiles: Seq[AddFile],
       condition: Column,
-      nameToAddFileMap: Map[String, AddFile]): Seq[TouchedFileWithDV] = {
+      nameToAddFileMap: Map[String, AddFile],
+      prefilterBeforeFilePath: Boolean = false): Seq[TouchedFileWithDV] = {
+    val conditionExpr = DFUDFShims.columnToExpr(condition)
+    // The native helper projects filePath before filtering so it survives joins introduced by
+    // subqueries and Python evaluation. A simple DELETE predicate can filter first and avoid
+    // materializing the path for rows that will not enter the bitmap aggregation.
+    val prefilter = prefilterBeforeFilePath && conditionExpr.deterministic &&
+      !conditionExpr.exists(_.isInstanceOf[SubqueryExpression]) &&
+      !conditionExpr.exists(_.isInstanceOf[PythonUDF])
+    val scan = if (prefilter) {
+      DMLWithDeletionVectorsHelperShims.filterBeforeFilePath(spark, targetScan, condition)
+    } else {
+      targetScan
+    }
     val gpuTargetDf = DMLWithDeletionVectorsHelperShims.withGpuExecutionContext(
-      spark, targetScan.dataFrame)
+      spark, scan.dataFrame)
     val candidatesHaveDVs =
       hasReadableDVs && candidateFiles.exists(_.deletionVector != null)
+    // Keep the native helper's original predicate for its other decisions. Reapplying it to the
+    // prefiltered rows is equivalent because this path only accepts deterministic predicates.
     val storedResults = DeletionVectorBitmapGenerator
       .buildRowIndexSetsForFilesMatchingCondition(
         spark,
@@ -53,9 +69,9 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
         candidatesHaveDVs,
         gpuTargetDf,
         candidateFiles,
-        DFUDFShims.columnToExpr(condition),
-        Some(targetScan.filePathColumn),
-        Some(targetScan.rowIndexColumn))
+        conditionExpr,
+        Some(scan.filePathColumn),
+        Some(scan.rowIndexColumn))
 
     DMLWithDeletionVectorsHelper.findFilesWithMatchingRows(
       txn, nameToAddFileMap, storedResults)

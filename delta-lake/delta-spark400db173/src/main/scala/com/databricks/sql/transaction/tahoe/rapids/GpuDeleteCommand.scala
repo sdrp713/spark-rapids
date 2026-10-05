@@ -49,7 +49,8 @@ case class GpuDeleteCommand(
       targetScan,
       candidateFiles,
       DFUDFShims.exprToColumn(deleteCondition),
-      nameToAddFileMap)
+      nameToAddFileMap,
+      prefilterBeforeFilePath = true)
     if (touchedFiles.nonEmpty) {
       Some(GpuDeletionVectorBitmapGenerator.processUnmodifiedData(
         sparkSession, touchedFiles, txn))
