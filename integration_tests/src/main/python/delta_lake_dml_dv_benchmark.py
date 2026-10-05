@@ -18,6 +18,7 @@ All table generation, cloning, plan inspection, and validation are outside the t
 Artifacts are retained in a unique child of pytest's explicit --tmp_path.
 The store_sales variant expects a separately validated local Parquet sample in
 <--tmp_path>/raw; it is never part of automatic integration-test discovery.
+It reports whether each command persisted DVs or rewrote files.
 """
 
 import json
@@ -148,6 +149,21 @@ def _assert_dvs(history, command):
         f"Persistent DV use was not proved: {metrics}"
 
 
+def _dml_strategy(metrics, command):
+    dv_prefix = "numTargetDeletionVectors" if command == "MERGE" else "numDeletionVectors"
+    file_key = "numTargetFilesRemoved" if command == "MERGE" else "numRemovedFiles"
+    has_dvs = sum(int(metrics.get(dv_prefix + suffix, 0))
+                  for suffix in ("Added", "Updated")) > 0
+    has_rewrites = int(metrics.get(file_key, 0)) > 0
+    if has_dvs and has_rewrites:
+        return "mixed"
+    if has_dvs:
+        return "persistent-dv"
+    if has_rewrites:
+        return "file-rewrite"
+    return "unknown"
+
+
 def _sql(command, path, source_path, threshold):
     predicate = f"pmod(id, {MODULUS}) < {threshold}"
     if command == "DELETE":
@@ -260,6 +276,8 @@ def _environment(spark):
             "spark.rapids.memory.host.spillStorageSize", "spark.rapids.sql.batchSizeBytes",
             "spark.rapids.memory.gpu.allocSize",
             "spark.rapids.sql.concurrentGpuTasks", "spark.dynamicAllocation.enabled",
+            "spark.rapids.sql.expression.InputFileName",
+            "spark.sql.files.maxPartitionBytes",
             "spark.databricks.clusterUsageTags.sparkVersion",
             "spark.databricks.photon.enabled"]
     return dict(spark_version=spark.version, master=sc.master, app_id=sc.applicationId,
@@ -364,7 +382,8 @@ def _run(request, settings, scale):
     _emit("complete", root=root, scale=scale)
 
 
-def _run_store_sales(request):
+def _run_store_sales(request, commands=("DELETE", "UPDATE", "MERGE"),
+                     repeats=STORE_SALES_REPEATS, scale="store-sales-local-10pct"):
     assert is_databricks173_or_later(), "This benchmark requires the DBR 17.3 DV implementation"
     assert not hasattr(request.config, "workerinput"), "Set TEST_PARALLEL=0"
     assert get_inject_oom_conf() is None, "Use --test_oom_injection_mode=never for timings"
@@ -380,10 +399,9 @@ def _run_store_sales(request):
     input_bytes = sum(os.path.getsize(path) for path in files)
     root = os.path.join(input_parent, "dv-benchmark-" + uuid.uuid4().hex)
     environment = _session(_environment)
-    scale = "store-sales-local-10pct"
     _emit("environment", root=root, scale=scale, source=source,
           input_files=len(files), input_bytes=input_bytes,
-          threshold=STORE_SALES_THRESHOLD, repeats=STORE_SALES_REPEATS, **environment)
+          threshold=STORE_SALES_THRESHOLD, repeats=repeats, **environment)
     assert environment["master"].startswith("local["), \
         "The downloaded sample is driver-local; run Spark in local mode"
     assert environment["jvm_max_heap_bytes"] >= 8 * 1024 ** 3, \
@@ -421,12 +439,14 @@ def _run_store_sales(request):
             .select(f.col("id"), (f.col("ss_quantity") + 1).alias("ss_quantity")) \
             .write.mode("errorifexists").parquet(source_path)
 
-    _session(write_source)
-    for command in ("DELETE", "UPDATE", "MERGE"):
+    if "MERGE" in commands:
+        _session(write_source)
+    for command in commands:
         case = f"{command}-{STORE_SALES_THRESHOLD}permille-existingdv-True"
         measured = {engine: [] for engine in ("CPU", "GPU")}
+        strategies = {engine: [] for engine in ("CPU", "GPU")}
         paired_speedups = []
-        for trial in range(STORE_SALES_REPEATS + 1):
+        for trial in range(repeats + 1):
             paths = {engine: root + f"/{case}/{trial}/{engine}"
                      for engine in ("CPU", "GPU")}
             for path in paths.values():
@@ -445,11 +465,19 @@ def _run_store_sales(request):
             for engine in order:
                 history = _session(lambda spark: _command_history(
                     spark, paths[engine], command))
-                _assert_dvs(history, command)
-                assert int(history["operationMetrics"][row_key]) == affected
+                metrics = history["operationMetrics"]
+                strategy = _dml_strategy(metrics, command)
+                strategies[engine].append(strategy)
                 _emit("sample", case=case, engine=engine, trial=trial,
                       warmup=trial == 0, path=paths[engine],
-                      metrics=history["operationMetrics"], **results[engine])
+                      strategy=strategy, metrics=metrics, **results[engine])
+                assert int(metrics[row_key]) == affected
+                if command == "MERGE":
+                    # This workload may rewrite files despite DV persistence being enabled.
+                    # Report that strategy, but never label it as a DV update.
+                    assert strategy != "unknown", f"MERGE write strategy is unknown: {metrics}"
+                else:
+                    _assert_dvs(history, command)
             if trial == 0:
                 _session(lambda spark: _validate_store_sales(
                     spark, base, seeded_version, paths["CPU"], paths["GPU"],
@@ -464,6 +492,9 @@ def _run_store_sales(request):
         _emit("summary", case=case, scale=scale, rows=rows,
               input_bytes=input_bytes, target_bytes=detail["sizeInBytes"],
               affected_rows=affected, initial_rows=initial_rows,
+              strategies=strategies,
+              same_strategy=all(cpu == gpu for cpu, gpu in
+                                zip(strategies["CPU"], strategies["GPU"])),
               cpu_seconds=measured["CPU"], gpu_seconds=measured["GPU"],
               cpu_median=cpu_median, gpu_median=gpu_median,
               speedup=cpu_median / gpu_median,
@@ -501,3 +532,9 @@ def test_dv_dml_benchmark_full(request):
 def test_dv_dml_benchmark_store_sales(request, monkeypatch):
     monkeypatch.setitem(CONF, "spark.sql.shuffle.partitions", "8")
     _run_store_sales(request)
+
+
+def test_dv_dml_benchmark_store_sales_delete_probe(request, monkeypatch):
+    monkeypatch.setitem(CONF, "spark.sql.shuffle.partitions", "8")
+    _run_store_sales(request, commands=("DELETE",), repeats=1,
+                     scale="store-sales-local-10pct-delete-probe")
