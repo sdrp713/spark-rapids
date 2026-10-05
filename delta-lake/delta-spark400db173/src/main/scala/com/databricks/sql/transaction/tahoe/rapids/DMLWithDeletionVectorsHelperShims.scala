@@ -31,30 +31,11 @@ import org.apache.spark.sql.types.StructType
 private[rapids] case class GpuTargetScan(
     dataFrame: DataFrame,
     filePathColumn: Column,
-    rowIndexColumn: Column,
-    filePathColumnName: String)
+    rowIndexColumn: Column)
 
 /** DBR 17.3 adapters for the target scan used by persistent-DV DML. */
 private[rapids] object DMLWithDeletionVectorsHelperShims {
   private val GpuFilePathColumnPrefix = "__delta_internal_gpu_file_path"
-
-  /** Evaluate the file path only for matched rows when filtering cannot introduce a join. */
-  def filterBeforeFilePath(
-      spark: SparkSession,
-      targetScan: GpuTargetScan,
-      condition: Column): GpuTargetScan = {
-    val filePathColumnName = targetScan.filePathColumnName
-    // Drop the old projection so Catalyst cannot evaluate input_file_name for unmatched rows.
-    val filtered = targetScan.dataFrame.drop(filePathColumnName)
-      .filter(condition)
-      .withColumn(filePathColumnName, input_file_name())
-    val resolver = spark.sessionState.conf.resolver
-    val filePathAttr = filtered.queryExecution.analyzed.output
-      .find(attr => resolver(attr.name, filePathColumnName)).get
-    targetScan.copy(
-      dataFrame = filtered,
-      filePathColumn = org.apache.spark.sql.nvidia.DFUDFShims.exprToColumn(filePathAttr))
-  }
 
   def withGpuExecutionContext(spark: SparkSession, df: DataFrame): DataFrame = {
     TrampolineConnectShims.createDataFrame(
@@ -109,7 +90,6 @@ private[rapids] object DMLWithDeletionVectorsHelperShims {
     GpuTargetScan(
       targetDf,
       org.apache.spark.sql.nvidia.DFUDFShims.exprToColumn(filePathAttr),
-      org.apache.spark.sql.nvidia.DFUDFShims.exprToColumn(rowIndexCol),
-      filePathColumnName)
+      org.apache.spark.sql.nvidia.DFUDFShims.exprToColumn(rowIndexCol))
   }
 }
