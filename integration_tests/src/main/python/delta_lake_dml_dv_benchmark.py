@@ -538,3 +538,9 @@ def test_dv_dml_benchmark_store_sales_delete_probe(request, monkeypatch):
     monkeypatch.setitem(CONF, "spark.sql.shuffle.partitions", "8")
     _run_store_sales(request, commands=("DELETE",), repeats=1,
                      scale="store-sales-local-10pct-delete-probe")
+
+
+def test_dv_dml_benchmark_store_sales_merge_probe(request, monkeypatch):
+    monkeypatch.setitem(CONF, "spark.sql.shuffle.partitions", "8")
+    _run_store_sales(request, commands=("MERGE",), repeats=1,
+                     scale="store-sales-local-10pct-merge-probe")
