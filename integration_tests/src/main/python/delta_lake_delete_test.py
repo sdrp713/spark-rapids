@@ -223,6 +223,8 @@ def test_delta_delete_with_deletion_vectors(
          "spark.databricks.delta.deletionVectors.useMetadataRowIndex":
              str(use_metadata_row_index).lower(),
          "spark.rapids.sql.delta.deletionVectors.predicatePushdown.enabled": "true"})
+    if is_databricks173_or_later():
+        conf["spark.sql.adaptive.enabled"] = "true"
     assert_delta_sql_delete_collect(
         spark_tmp_path,
         use_cdf=use_cdf,

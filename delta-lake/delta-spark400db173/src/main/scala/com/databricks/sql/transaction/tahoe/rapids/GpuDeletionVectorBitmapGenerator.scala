@@ -90,7 +90,7 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
     }
 
     def add(index: Long): Unit = {
-      require(index >= 0, s"Invalid DELETE physical row index: $index")
+      require(index >= 0, s"Invalid DML physical row index: $index")
       // NumericRange has an Int-sized length, so split exceptionally long consecutive runs.
       if (rangeStart < 0) {
         rangeStart = index
@@ -113,11 +113,11 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
   }
 
   /**
-   * DELETE keeps its predicate and file-ID lookup columnar on GPU. Each scan task copies only the
+   * DML keeps its predicate and file-ID lookup columnar on GPU. Each scan task copies only the
    * matched file IDs and row indexes to host and builds compact partial bitmaps before the shuffle.
    * DBR's writer still merges any old DV and persists the replacement DV.
    */
-  def findTouchedFilesForDelete(
+  def findTouchedFilesWithPartialBitmaps(
       spark: SparkSession,
       txn: OptimisticTransaction,
       hasReadableDVs: Boolean,
@@ -136,19 +136,21 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       (SparkPath.fromPath(new Path(path)).urlEncoded, path, existingDv)
     }.toArray
     require(fileMetadata.map(_._1).distinct.length == fileMetadata.length,
-      "Different DELETE candidate files have the same encoded scan path")
+      "Different DML candidate files have the same encoded scan path")
     val fileIds = spark.createDataset(fileMetadata.indices.map { id =>
       (fileMetadata(id)._1, id.toLong)
     }).toDF(FilePathColumn, FileIdColumn)
 
-    val gpuTargetDf = DMLWithDeletionVectorsHelperShims.withGpuExecutionContext(
-      spark, targetScan.dataFrame)
-    val matchedRows = gpuTargetDf.filter(condition)
+    val matchedRows = targetScan.dataFrame.filter(condition)
       .select(targetScan.filePathColumn.as(FilePathColumn),
         targetScan.rowIndexColumn.as(RowIndexColumn))
       .join(broadcast(fileIds), Seq(FilePathColumn), "left_outer")
       .select(col(FileIdColumn), col(RowIndexColumn))
-    val queryExecution = matchedRows.queryExecution
+    // Keep the columnar consumer above the join. With AQE, planning matchedRows on its own
+    // places AdaptiveSparkPlanExec at the root, where the GPU transition rule cannot see that
+    // this method consumes columnar batches. The command stub gives AQE that context.
+    val queryExecution = DMLWithDeletionVectorsHelperShims
+      .withGpuExecutionContext(spark, matchedRows).queryExecution
     val columnarPlan = queryExecution.executedPlan match {
       case GpuColumnarToRowExec(child: GpuExec, _) => Some(child)
       case plan: GpuExec if plan.supportsColumnar => Some(plan)
@@ -158,25 +160,25 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
     columnarPlan match {
       case Some(plan) =>
         val storedResults = SQLExecution.withNewExecutionId(
-          queryExecution, Some("DELETE partial deletion vectors")) {
+          queryExecution, Some("DML partial deletion vectors")) {
           val fileCount = fileMetadata.length
           val partialBitmaps = plan.executeColumnar().mapPartitions { batches =>
             val bitmaps = mutable.HashMap.empty[Long, PartialBitmap]
             batches.foreach { batch =>
               withResource(batch) { gpuBatch =>
                 val columns = GpuColumnVector.extractBases(gpuBatch)
-                require(columns.length == 2, "DELETE bitmap scan must return file ID and row index")
+                require(columns.length == 2, "DML bitmap scan must return file ID and row index")
                 withResource(columns(0).copyToHost()) { ids =>
                   withResource(columns(1).copyToHost()) { indexes =>
                     GpuSemaphore.releaseIfNecessary(TaskContext.get())
                     for (row <- 0 until gpuBatch.numRows()) {
                       require(!ids.isNull(row),
-                        "A matched DELETE file was absent from the candidate-file map")
+                        "A matched DML file was absent from the candidate-file map")
                       require(!indexes.isNull(row),
-                        "The DELETE scan produced a null physical row index")
+                        "The DML scan produced a null physical row index")
                       val fileId = ids.getLong(row)
                       require(fileId >= 0 && fileId < fileCount,
-                        s"Invalid DELETE file ID: $fileId")
+                        s"Invalid DML file ID: $fileId")
                       bitmaps.getOrElseUpdate(fileId, new PartialBitmap()).add(
                         indexes.getLong(row))
                     }

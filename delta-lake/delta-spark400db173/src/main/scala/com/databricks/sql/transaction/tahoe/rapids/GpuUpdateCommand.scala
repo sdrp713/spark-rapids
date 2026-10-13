@@ -55,12 +55,11 @@ case class GpuUpdateCommand(
       Option[PersistentDvTouchedFiles] = {
     val targetScan = DMLWithDeletionVectorsHelperShims.createTargetDfForGpuScanningForMatches(
       sparkSession, target, fileIndex)
-    val touchedFiles = GpuDeletionVectorBitmapGenerator.findTouchedFiles(
+    val touchedFiles = GpuDeletionVectorBitmapGenerator.findTouchedFilesWithPartialBitmaps(
       sparkSession,
       txn,
       hasReadableDVs = DeletionVectorUtils.deletionVectorsReadable(txn.snapshot),
       targetScan,
-      candidateFiles,
       DFUDFShims.exprToColumn(updateCondition),
       nameToAddFileMap)
     Some(new DbrPersistentDvTouchedFiles(touchedFiles))
