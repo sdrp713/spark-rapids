@@ -40,6 +40,8 @@ import org.apache.spark.TaskContext
 import org.apache.spark.paths.SparkPath
 import org.apache.spark.sql.{Column, Encoder, SparkSession}
 import org.apache.spark.sql.execution.SQLExecution
+import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.functions.{broadcast, col}
 import org.apache.spark.sql.nvidia.DFUDFShims
 
@@ -151,11 +153,13 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       .join(broadcast(fileIds), Seq(FilePathColumn), "left_outer")
       .select(col(FileIdColumn), col(RowIndexColumn))
     val queryExecution = matchedRows.queryExecution
-    val columnarPlan = queryExecution.executedPlan match {
-      case GpuColumnarToRowExec(child: GpuExec, _) => Some(child)
-      case plan: GpuExec if plan.supportsColumnar => Some(plan)
+    def gpuColumnarPlan(plan: SparkPlan): Option[GpuExec] = plan match {
+      case adaptive: AdaptiveSparkPlanExec => gpuColumnarPlan(adaptive.executedPlan)
+      case GpuColumnarToRowExec(child, _) => gpuColumnarPlan(child)
+      case gpu: GpuExec if gpu.supportsColumnar => Some(gpu)
       case _ => None
     }
+    val columnarPlan = gpuColumnarPlan(queryExecution.executedPlan)
 
     columnarPlan match {
       case Some(plan) =>
