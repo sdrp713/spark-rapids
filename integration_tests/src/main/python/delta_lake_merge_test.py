@@ -1526,7 +1526,7 @@ def test_delta_merge_insert_only_after_unmodified_match_metrics(
         assert plan_metric(command_plans[-1], key) == 0, key
 
 
-@allow_non_gpu(*delta_meta_allow)
+@allow_non_gpu("ExternalRDDScanExec", *delta_meta_allow)
 @delta_lake
 @ignore_order
 @pytest.mark.skipif(not is_databricks173_or_later(),
@@ -1534,6 +1534,8 @@ def test_delta_merge_insert_only_after_unmodified_match_metrics(
 def test_delta_delete_dv_gpu_bitmap_scan_with_aqe(spark_tmp_path):
     path = spark_tmp_path + "/DELTA_DATA"
     conf = copy_and_update(delta_writes_enabled_conf, {
+        "spark.rapids.sql.command.DeleteCommand": "true",
+        "spark.rapids.sql.command.DeleteCommandEdge": "true",
         "spark.sql.adaptive.enabled": "true",
         "spark.databricks.delta.delete.deletionVectors.persistent": "true",
         "spark.databricks.delta.deletionVectors.useMetadataRowIndex": "true"})
