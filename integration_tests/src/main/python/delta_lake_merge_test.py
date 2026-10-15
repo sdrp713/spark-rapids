@@ -1546,7 +1546,9 @@ def test_delta_delete_dv_gpu_bitmap_scan_with_aqe(spark_tmp_path):
                 .save(path + "/" + engine)
 
     def delete(spark, engine):
-        return spark.sql(f"DELETE FROM delta.`{path}/{engine}` WHERE id = 2").collect()
+        result = spark.sql(f"DELETE FROM delta.`{path}/{engine}` WHERE id = 2").collect()
+        assert spark.conf.get("spark.sql.adaptive.enabled") == "true"
+        return result
 
     with_cpu_session(setup, conf=conf)
     cpu_result = with_cpu_session(lambda spark: delete(spark, "CPU"), conf=conf)

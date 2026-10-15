@@ -129,7 +129,14 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       targetScan: GpuTargetScan,
       condition: Column,
       nameToAddFileMap: Map[String, AddFile]): Seq[TouchedFileWithDV] = {
-    import spark.implicits._
+    // This scan's broadcast join must be planned without AQE. A thread-local SQLConf override
+    // does not control QueryExecution's session-owned planner on DBR, so use an isolated session.
+    val scanSpark = spark.newSession()
+    spark.sessionState.conf.getAllConfs.foreach { case (key, value) =>
+      scanSpark.sessionState.conf.setConfString(key, value)
+    }
+    scanSpark.sessionState.conf.setConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED, false)
+    import scanSpark.implicits._
 
     val fileMetadata = nameToAddFileMap.toSeq.sortBy(_._1).map { case (path, add) =>
       val existingDv = if (hasReadableDVs) {
@@ -142,12 +149,12 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
     }.toArray
     require(fileMetadata.map(_._1).distinct.length == fileMetadata.length,
       "Different DELETE candidate files have the same encoded scan path")
-    val fileIds = spark.createDataset(fileMetadata.indices.map { id =>
+    val fileIds = scanSpark.createDataset(fileMetadata.indices.map { id =>
       (fileMetadata(id)._1, id.toLong)
     }).toDF(FilePathColumn, FileIdColumn)
 
     val gpuTargetDf = DMLWithDeletionVectorsHelperShims.withGpuExecutionContext(
-      spark, targetScan.dataFrame)
+      scanSpark, targetScan.dataFrame)
     val matchedRows = gpuTargetDf.filter(condition)
       .select(targetScan.filePathColumn.as(FilePathColumn),
         targetScan.rowIndexColumn.as(RowIndexColumn))
@@ -159,17 +166,8 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       case gpu: GpuExec if gpu.supportsColumnar => Some(gpu)
       case _ => None
     }
-    // AQE exposes a pre-execution CPU join here, before GPU transition rules have run. Keep the
-    // caller's session untouched and plan only this fixed broadcast join without AQE.
-    val scanConf = new SQLConf()
-    spark.sessionState.conf.getAllConfs.foreach { case (key, value) =>
-      scanConf.setConfString(key, value)
-    }
-    scanConf.setConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED, false)
-    val (queryExecution, columnarPlan) = SQLConf.withExistingConf(scanConf) {
-      val execution = matchedRows.queryExecution
-      (execution, gpuColumnarPlan(execution.executedPlan))
-    }
+    val queryExecution = matchedRows.queryExecution
+    val columnarPlan = gpuColumnarPlan(queryExecution.executedPlan)
 
     columnarPlan match {
       case Some(plan) =>
