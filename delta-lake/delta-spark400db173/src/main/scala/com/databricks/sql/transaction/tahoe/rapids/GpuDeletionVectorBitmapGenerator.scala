@@ -43,6 +43,7 @@ import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.functions.{broadcast, col}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.nvidia.DFUDFShims
 
 private[rapids] object GpuDeletionVectorBitmapGenerator {
@@ -152,14 +153,23 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
         targetScan.rowIndexColumn.as(RowIndexColumn))
       .join(broadcast(fileIds), Seq(FilePathColumn), "left_outer")
       .select(col(FileIdColumn), col(RowIndexColumn))
-    val queryExecution = matchedRows.queryExecution
     def gpuColumnarPlan(plan: SparkPlan): Option[GpuExec] = plan match {
       case adaptive: AdaptiveSparkPlanExec => gpuColumnarPlan(adaptive.executedPlan)
       case GpuColumnarToRowExec(child, _) => gpuColumnarPlan(child)
       case gpu: GpuExec if gpu.supportsColumnar => Some(gpu)
       case _ => None
     }
-    val columnarPlan = gpuColumnarPlan(queryExecution.executedPlan)
+    // AQE exposes a pre-execution CPU join here, before GPU transition rules have run. Keep the
+    // caller's session untouched and plan only this fixed broadcast join without AQE.
+    val scanConf = new SQLConf()
+    spark.sessionState.conf.getAllConfs.foreach { case (key, value) =>
+      scanConf.setConfString(key, value)
+    }
+    scanConf.setConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED, false)
+    val (queryExecution, columnarPlan) = SQLConf.withExistingConf(scanConf) {
+      val execution = matchedRows.queryExecution
+      (execution, gpuColumnarPlan(execution.executedPlan))
+    }
 
     columnarPlan match {
       case Some(plan) =>
