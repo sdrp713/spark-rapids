@@ -42,7 +42,7 @@ import org.apache.spark.sql.{Column, Encoder, SparkSession}
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
-import org.apache.spark.sql.functions.{broadcast, col}
+import org.apache.spark.sql.functions.{broadcast, col, input_file_name}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.nvidia.DFUDFShims
 
@@ -153,10 +153,14 @@ private[rapids] object GpuDeletionVectorBitmapGenerator {
       (fileMetadata(id)._1, id.toLong)
     }).toDF(FilePathColumn, FileIdColumn)
 
+    // Keep the predicate below input_file_name(), whose non-deterministic projection otherwise
+    // prevents Spark from pushing the predicate into the Parquet scan.
+    val filteredTargetDf = targetScan.dataFrameWithoutFilePath.filter(condition)
+      .withColumn(targetScan.filePathColumnName, input_file_name())
     val gpuTargetDf = DMLWithDeletionVectorsHelperShims.withGpuExecutionContext(
-      scanSpark, targetScan.dataFrame)
-    val matchedRows = gpuTargetDf.filter(condition)
-      .select(targetScan.filePathColumn.as(FilePathColumn),
+      scanSpark, filteredTargetDf)
+    val matchedRows = gpuTargetDf
+      .select(col(targetScan.filePathColumnName).as(FilePathColumn),
         targetScan.rowIndexColumn.as(RowIndexColumn))
       .join(broadcast(fileIds), Seq(FilePathColumn), "left_outer")
       .select(col(FileIdColumn), col(RowIndexColumn))
