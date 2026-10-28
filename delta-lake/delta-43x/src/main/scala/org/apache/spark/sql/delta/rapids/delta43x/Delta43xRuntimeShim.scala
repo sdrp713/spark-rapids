@@ -34,8 +34,8 @@ import org.apache.spark.sql.delta.{TableFeature, VariantShreddingPreviewTableFea
   VariantShreddingTableFeature}
 import org.apache.spark.sql.delta.actions.{AddFile, FileAction, Metadata}
 import org.apache.spark.sql.delta.catalog.DeltaCatalog
-import org.apache.spark.sql.delta.commands.{DeltaReorgOperation, DMLWithDeletionVectorsHelper,
-  TouchedFileWithDV, UpdateCommand, WriteIntoDelta}
+import org.apache.spark.sql.delta.commands.{CreateDeltaTableLikeShims, DeltaReorgOperation,
+  DMLWithDeletionVectorsHelper, TouchedFileWithDV, UpdateCommand, WriteIntoDelta}
 import org.apache.spark.sql.delta.hooks.GpuAutoCompact43x
 import org.apache.spark.sql.delta.rapids.{DeltaRuntimeShimBase, DeltaVariantShreddingShim,
   DMLWithDeletionVectorsRuntimeShim, GpuDeltaLog, GpuOptimisticTransactionBase,
@@ -58,6 +58,12 @@ class Delta43xRuntimeShim extends DeltaRuntimeShimBase
     val prefixLength = StatsCollectionUtils.getDataSkippingStringPrefixLength(spark, txn.metadata)
     DMLWithDeletionVectorsHelper.processUnmodifiedData(
       spark, touchedFiles, txn.snapshot, prefixLength)
+  }
+
+  override def isV1WriterSaveAsTableOverwrite(
+      options: DeltaOptions,
+      mode: SaveMode): Boolean = {
+    CreateDeltaTableLikeShims.isV1WriterSaveAsTableOverwrite(options, mode)
   }
 
   override def groupOptimizeFilesByPartition(
